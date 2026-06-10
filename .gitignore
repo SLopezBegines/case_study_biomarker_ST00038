@@ -1,0 +1,48 @@
+# Data — usually too large for git; commit metadata/manifests instead
+rawdata/
+data/
+output/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets — never commit these
+.env
+*.key
+*credentials*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+env/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# renv — library is reconstructed from renv.lock; don't commit it
+renv/library/
+renv/local/
+renv/staging/
+renv/python/
+renv/sandbox/

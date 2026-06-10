@@ -1,0 +1,9 @@
+name: case_study_biomarker_ST000369
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - -r requirements.txt
