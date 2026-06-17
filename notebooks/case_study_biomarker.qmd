@@ -1,0 +1,342 @@
+---
+title: "Case Study — Lung Adenocarcinoma Serum/Plasma Metabolomics: QC & Differential Analysis (MetaboAnalystR)"
+author: "Santiago López Begines"
+date: "`r Sys.Date()`"
+format:
+  html:
+    theme: lux
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    code-line-numbers: true
+    fig-width: 10
+    fig-height: 8
+    fig-cap-location: bottom
+    highlight-style: tango
+---
+
+```{r setup, include=FALSE}
+# All comments in English.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This notebook is **Track A (univariate inferential / differential)** of the
+biomarker case study (see `docs/case_study_ML_biomarker_design.md`). It performs
+quality control (preprocessing, missing values, imputation, normalization) and
+differential analysis of **Adenocarcinoma vs Healthy** using **MetaboAnalystR**,
+following the lab's established `mSet` workflow.
+
+Data come from two GC-TOF-MS cohorts of the same project (PR000293):
+**ADC1 = ST000368** (training) and **ADC2 = ST000369** (independent validation).
+Per the design, the differential is run **within ADC1**, **separately per
+biofluid** (Plasma, Serum), on the **137 metabolites shared** by both cohorts.
+Modelling per biofluid means one sample per patient, avoiding plasma–serum
+pairing leakage.
+
+# Setting up environment
+
+```{r env}
+# Output locations for this notebook
+NB_OUT <- file.path(PROJ, "notebooks", "output", "ST000368")
+
+# Project parameters and paths
+source(file.path("..", "config", "params.R"))   # defines PROJ, DATA, FIG, TAB, REP, PARAMS
+
+
+set.seed(PARAMS$seed)
+
+# Differential thresholds.
+# NOTE: in this blood metabolomics comparison effect sizes are small
+# (|log2FC| < ~0.25, i.e. FC < ~1.2), so a 1.5-2.0 fold-change cut-off 
+# removes essentially everything. Here significance
+# is FDR-led and the fold-change is treated as descriptive, with a light guide.
+FC_THRESH   <- 1.2    # descriptive fold-change guide (not a hard filter)
+PVAL_THRESH <- 0.05   # primary significance threshold (FDR-controlled)
+
+# Libraries
+source(file.path(PROJ, "code","00_packages.R"))
+
+# MetaboAnalystR is the engine for QC + differential. It is heavy and is
+# normally available in the analyst's environment. The notebook degrades
+# gracefully: if MetaboAnalystR is not installed, the MetaboAnalystR chunks
+# are skipped and an independent base-R differential cross-check still runs.
+HAS_METABO <- requireNamespace("MetaboAnalystR", quietly = TRUE)
+if (HAS_METABO) suppressMessages(library(MetaboAnalystR))
+# InitDataObjects reads default.dpi from .GlobalEnv; define it before any call.
+if (!exists("dpi")) dpi <- 150
+
+cat("MetaboAnalystR available:", HAS_METABO, "\n")
+
+# Aux functions
+source(file.path(PROJ, "code", "01_aux_functions.R"))
+source(file.path(PROJ, "code", "02_aux_metabolomics.R"))
+
+```
+
+
+
+
+# Loading data
+
+Build matrices
+```{r}
+source(file.path(PROJ, "code", "03_build_matrices.R"))
+```
+
+
+Pre-built analysis matrices are produced by `code/01_build_matrices.R`
+(run it first). Each file holds samples in rows: metadata columns
+(`sample_id`, `cohort`, `biofluid`, `class`, `smoker`, `gender`) followed by the
+137 shared metabolites.
+
+```{r load}
+read_matrix <- function(name)
+  read.csv(file.path(DATA, paste0(name, ".csv")), check.names = FALSE)
+
+mats <- list(
+  ADC1_Plasma = read_matrix("ADC1_Plasma"),
+  ADC1_Serum  = read_matrix("ADC1_Serum"),
+  ADC2_Plasma = read_matrix("ADC2_Plasma"),
+  ADC2_Serum  = read_matrix("ADC2_Serum")
+)
+META_COLS <- c("sample_id", "cohort", "biofluid", "class", "smoker", "gender")
+FEATURES  <- setdiff(colnames(mats$ADC1_Plasma), META_COLS)
+cat("Shared metabolites (features):", length(FEATURES), "\n")
+```
+
+# Experimental design
+
+```{r design}
+comp <- do.call(rbind, lapply(mats, function(d)
+  as.data.frame(table(cohort = d$cohort, biofluid = d$biofluid, class = d$class))))
+comp <- comp[comp$Freq > 0, ]
+knitr::kable(comp, caption = "Composition: Adenocarcinoma vs Healthy by cohort and biofluid") |> 
+  kableExtra::kable_paper(full_width = FALSE, position = "center")
+```
+
+The differential (Track A) uses the **ADC1** cohort, one model per biofluid.
+
+# Quality Control (MetaboAnalystR)
+
+MetaboAnalystR expects a "samples-in-rows, unpaired" (`rowu`) table whose first
+column is the sample name, second column the class label, and remaining columns
+the metabolites. The helper below writes that table and walks the standard
+`mSet` QC sequence.
+
+## Helper: build mSet input
+
+```{r helper-input}
+# Convert an analysis matrix to MetaboAnalystR 'rowu' input and write a temp CSV.
+to_metabo_csv <- function(df) {
+  out <- data.frame(Sample = df$sample_id,
+                    Label  = as.character(df$class),
+                    check.names = FALSE)
+  out <- cbind(out, df[, intersect(FEATURES, colnames(df)), drop = FALSE])
+  f <- tempfile(fileext = ".csv")
+  write.csv(out, f, row.names = FALSE)
+  f
+}
+```
+
+## QC + Differential pipeline (mSet)
+
+The pipeline below covers the requested QC steps and the differential analysis:
+
+- **Dimensions / sanity:** `SanityCheckData()`
+- **Missing values:** `RemoveMissingPercent()` drops features with too many NAs.
+- **Imputation:** `ImputeMissingVar()`. Methods available include `"min"`
+  (1/5 of the feature minimum, as in the lab's `ReplaceMin`), `"mean"`,
+  `"median"`, `"knn_var"`, `"knn_smp"`, `"bpca"`, `"ppca"`, `"svdImpute"`,
+  `"rf"`. Here GC-TOF-MS missingness is low (<4% per feature), so a simple
+  `"min"` replacement is appropriate; `"knn_var"` is a reasonable alternative.
+- **Normalization / transformation / scaling:** `Normalization(rowNorm,
+  transNorm, scaleNorm)`. Row options include `"NULL"`, `"SumNorm"`,
+  `"MedianNorm"`, `"QuantileNorm"`; transform `"LogNorm"`/`"CrNorm"`;
+  scale `"MeanCenter"`, `"AutoNorm"` (unit variance), `"ParetoNorm"`,
+  `"RangeNorm"`. The data are already BinBase-processed, so no row
+  normalization is applied; we use **LogNorm + MeanCenter** (the lab default).
+- **PCA / clustering** for outlier and structure inspection.
+- **Differential:** fold-change, t-test (FDR), and volcano.
+
+```{r metabo-pipeline, eval=HAS_METABO}
+
+label <- "ADC1_Plasma"
+df <- mats$ADC1_Serum
+dpi <- 72
+default.dpi <- 72
+
+library(MetaboAnalystR)
+mSet <- InitDataObjects("conc", "stat", FALSE, default.dpi = dpi)
+
+# Run the full MetaboAnalystR QC + differential pipeline for one matrix.
+# Plots are written with absolute imgName into output/figures; MetaboAnalystR's
+# side-effect .qs files are contained in a per-run scratch dir.
+run_qc_diff <- function(df, label, impute = "min",
+                        rowNorm = "NULL", transNorm = "LogNorm",
+                        scaleNorm = "MeanCenter", dpi = 150) {
+  csv <- to_metabo_csv(df)
+
+  mSet <- InitDataObjects("conc", "stat", FALSE, default.dpi = dpi)
+  mSet <- Read.TextData(mSet, csv, "rowu", "disc")
+  unlink(csv)
+
+  # QC: sanity, missing values, imputation
+  mSet <- SanityCheckData(mSet)
+  mSet <- RemoveMissingPercent(mSet, percent = 0.5)
+  mSet <- ImputeMissingVar(mSet, method = impute)
+
+  # Normalization / transformation / scaling
+  mSet <- PreparePrenormData(mSet)
+  mSet <- Normalization(mSet, rowNorm, transNorm, scaleNorm, ratio = FALSE)
+  mSet <- PlotNormSummary(mSet, file.path(FIG, paste0("metabo_", label, "_norm")),
+                          "png", dpi, width = NA)
+  mSet <- PlotSampleNormSummary(mSet,
+                          file.path(FIG, paste0("metabo_", label, "_sample_norm")),
+                          "png", dpi, width = NA)
+
+  # PCA (outlier / structure inspection)
+  mSet <- PCA.Anal(mSet)
+  mSet <- PlotPCA2DScore(mSet, file.path(FIG, paste0("metabo_", label, "_pca2d")),
+                         "png", dpi, width = NA, 1, 2, 0.95, 1, 0)
+
+  # Differential: fold-change, t-test (FDR), volcano
+  mSet <- FC.Anal.unpaired(mSet, FC_THRESH, FALSE)
+  mSet <- Ttests.Anal(mSet, nonpar = FALSE, threshp = PVAL_THRESH,
+                      paired = FALSE, equal.var = TRUE, pvalType = "fdr")
+  mSet <- Volcano.Anal(mSet, paired = FALSE, fcthresh = FC_THRESH, cmpType = 1,
+                       nonpar = FALSE, threshp = PVAL_THRESH, equal.var = TRUE,
+                       pval.type = "fdr")
+  mSet <- PlotVolcano(mSet, file.path(FIG, paste0("metabo_", label, "_volcano")),
+                      1, 0, "png", dpi, width = NA)
+
+  # Export the differential statistics table.
+  # Join by name to avoid positional mis-pairing if fc and tt slot orders differ.
+  tt_df <- data.frame(
+    metabolite = names(mSet$analSet$tt$p.value),
+    t_score    = as.numeric(mSet$analSet$tt$t.score),
+    fdr        = as.numeric(mSet$analSet$tt$p.value),
+    stringsAsFactors = FALSE)
+  fc_df <- data.frame(
+    metabolite = names(mSet$analSet$fc$fc.log),
+    log2FC     = as.numeric(mSet$analSet$fc$fc.log),
+    stringsAsFactors = FALSE)
+  stat <- merge(tt_df, fc_df, by = "metabolite", all.x = TRUE)
+  stat <- stat[order(stat$fdr), c("metabolite", "log2FC", "t_score", "fdr")]
+  write.csv(stat, file.path(TAB, paste0("differential_metabo_", label, ".csv")),
+            row.names = FALSE)
+  saveRDS(mSet, file.path(NB_OUT, "metabo", paste0("mSet_", label, ".rds")))
+  list(mSet = mSet, stat = stat)
+}
+
+res_plasma <- run_qc_diff(mats$ADC1_Plasma, "ADC1_Plasma")
+res_serum  <- run_qc_diff(mats$ADC1_Serum,  "ADC1_Serum")
+
+knitr::kable(head(res_plasma$stat, 15),
+             caption = "ADC1 Plasma — top differential metabolites (MetaboAnalystR)")
+knitr::kable(head(res_serum$stat, 15),
+             caption = "ADC1 Serum — top differential metabolites (MetaboAnalystR)")
+```
+
+```{r metabo-volcano-show, eval=HAS_METABO, echo=FALSE}
+# Embed the MetaboAnalystR volcano plots if they were produced.
+vfiles <- list.files(FIG, pattern = "metabo_ADC1_(Plasma|Serum)_volcano.*\\.png$",
+                     full.names = TRUE)
+if (length(vfiles)) knitr::include_graphics(vfiles)
+```
+
+# Differential analysis — independent base-R cross-check
+
+This section is **engine-independent**: it reproduces the differential with base
+R (log10 transform, Welch t-test per metabolite, Benjamini–Hochberg FDR,
+log2 fold-change of group means). It always runs, validates the MetaboAnalystR
+result, and renders even when MetaboAnalystR is unavailable.
+
+```{r base-diff}
+# Per-metabolite differential for one matrix: Adenocarcinoma vs Healthy.
+diff_base <- function(df) {
+  X  <- as.matrix(df[, FEATURES, drop = FALSE])
+  Xl <- log10(X + 1)                              # stabilise variance
+  cls <- factor(df$class,
+                levels = c(PARAMS$negative_class, PARAMS$positive_class))
+  pos <- cls == PARAMS$positive_class             # Adenocarcinoma
+  neg <- cls == PARAMS$negative_class             # Healthy
+  res <- t(apply(Xl, 2, function(v) {
+    tt <- tryCatch(t.test(v[pos], v[neg]), error = function(e) NULL)
+    c(log2FC = mean(v[pos], na.rm = TRUE) - mean(v[neg], na.rm = TRUE),
+      p      = if (is.null(tt)) NA else tt$p.value)
+  }))
+  out <- data.frame(metabolite = rownames(res),
+                    log2FC = res[, "log2FC"],
+                    p_value = res[, "p"], row.names = NULL)
+  out$FDR <- p.adjust(out$p_value, method = "BH")
+  out[order(out$p_value), ]
+}
+
+diff_plasma <- diff_base(mats$ADC1_Plasma)
+diff_serum  <- diff_base(mats$ADC1_Serum)
+
+write.csv(diff_plasma, file.path(TAB, "differential_baseR_ADC1_Plasma.csv"), row.names = FALSE)
+write.csv(diff_serum,  file.path(TAB, "differential_baseR_ADC1_Serum.csv"),  row.names = FALSE)
+
+cat(sprintf("ADC1 Plasma: %d/%d metabolites with FDR < %.2f\n",
+            sum(diff_plasma$FDR < PVAL_THRESH, na.rm = TRUE), nrow(diff_plasma), PVAL_THRESH))
+cat(sprintf("ADC1 Serum : %d/%d metabolites with FDR < %.2f\n",
+            sum(diff_serum$FDR < PVAL_THRESH, na.rm = TRUE), nrow(diff_serum), PVAL_THRESH))
+
+knitr::kable(head(diff_plasma, 15), caption = "ADC1 Plasma — top differential (base-R cross-check)")
+knitr::kable(head(diff_serum, 15),  caption = "ADC1 Serum — top differential (base-R cross-check)")
+```
+
+# Visualization — volcano (base-R cross-check)
+
+```{r base-volcano, fig.width=11, fig.height=5.5}
+volcano_base <- function(d, title, fc = log2(FC_THRESH), p = PVAL_THRESH) {
+  lp  <- -log10(d$p_value)
+  # Significance is FDR-led; fold-change lines are descriptive guides only.
+  sig <- d$FDR < p
+  col <- ifelse(sig & d$log2FC > 0, "#e41a1c",
+         ifelse(sig & d$log2FC < 0, "#377eb8", "grey70"))
+  plot(d$log2FC, lp, pch = 19, cex = 0.8, col = col,
+       xlab = "log2 fold-change (Adenocarcinoma / Healthy)",
+       ylab = "-log10 p-value", main = title)
+  abline(h = -log10(p), lty = 2, col = "grey50")
+  abline(v = c(-fc, fc), lty = 2, col = "grey50")
+  k <- which(sig); k <- k[order(d$p_value[k])][seq_len(min(8, length(k)))]
+  if (length(k)) text(d$log2FC[k], lp[k], d$metabolite[k], cex = 0.6, pos = 3)
+}
+par(mfrow = c(1, 2))
+volcano_base(diff_plasma, "ADC1 Plasma")
+volcano_base(diff_serum,  "ADC1 Serum")
+```
+
+> Note on expectations: the EDA (Stage 1) showed the cancer-vs-healthy signal is
+> weak relative to batch and biofluid structure (PC R²_class ≤ 0.06). A modest
+> number of FDR-significant metabolites is therefore expected; this is an honest
+> reflection of the biology, not an analytical failure.
+
+# Feature Selection
+
+Out of scope for Track A. Multivariate feature selection (LASSO / elastic net
+with in-fold selection) is part of **Track B (predictive, Python)**; see the
+design document.
+
+# Modeling
+
+Out of scope here. Track B trains per-biofluid classifiers on ADC1 and validates
+once on ADC2 (138 → 137 shared metabolites).
+
+# Model Evaluation
+
+Out of scope here. See Track B for external-validation metrics (AUROC, AUPRC,
+balanced accuracy) and the Track A vs Track B synthesis.
+
+---
+
+*Engine: MetaboAnalystR (QC + differential), mirrored from the lab's
+`r_projects/metabolomic` workflow. Differential cross-checked with base R.*
+```
