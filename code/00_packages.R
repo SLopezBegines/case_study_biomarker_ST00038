@@ -70,7 +70,9 @@ cran_packages <- c(
   # Bioconductor installer
   "BiocManager",
   # Markdown tables
-  "kableExtra"
+  "kableExtra",
+  # Missing Values
+  "DataExplorer", "VIM"
 )
 
 metaboanalyst_packages <- c(

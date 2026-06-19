@@ -39,6 +39,7 @@ build/
 .RData
 .Ruserdata
 .Rproj.user/
+*.qs
 
 # renv — library is reconstructed from renv.lock; don't commit it
 renv/library/

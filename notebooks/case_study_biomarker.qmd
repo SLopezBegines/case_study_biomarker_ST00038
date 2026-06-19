@@ -41,8 +41,6 @@ pairing leakage.
 # Setting up environment
 
 ```{r env}
-# Output locations for this notebook
-NB_OUT <- file.path(PROJ, "notebooks", "output", "ST000368")
 
 # Project parameters and paths
 source(file.path("..", "config", "params.R"))   # defines PROJ, DATA, FIG, TAB, REP, PARAMS
@@ -121,12 +119,78 @@ knitr::kable(comp, caption = "Composition: Adenocarcinoma vs Healthy by cohort a
 
 The differential (Track A) uses the **ADC1** cohort, one model per biofluid.
 
+```{r}
+# Clean enviroment
+rm(adc1, adc2, fr, matrices, mdata.all, mdata.siggenes,obj, sample_sheet, shared_tbl)
+```
+
+
 # Quality Control (MetaboAnalystR)
 
 MetaboAnalystR expects a "samples-in-rows, unpaired" (`rowu`) table whose first
 column is the sample name, second column the class label, and remaining columns
 the metabolites. The helper below writes that table and walks the standard
 `mSet` QC sequence.
+Before generating `mSet` object, check missing values distribution 
+## Missing values
+
+```{r}
+convert_to_factor <- function(df){
+df <- df |> 
+  dplyr::mutate(cohort = as.factor(cohort),
+                biofluid = as.factor(biofluid),
+                class = as.factor(class),
+                smoker = as.factor(smoker),
+                gender = as.factor(gender))
+}
+
+mats <- lapply(mats, convert_to_factor)
+
+```
+
+```{r}
+# Check NA distribution
+
+cat("Missing Values presence: \n")
+cat("ADC1_Plasma: ", anyNA(mats$ADC1_Plasma), "\n")
+cat("ADC1_Serum: ", anyNA(mats$ADC1_Serum), "\n")
+cat("ADC2_Plasma: ", anyNA(mats$ADC2_Plasma), "\n")
+cat("ADC2_Serum: ", anyNA(mats$ADC2_Serum), "\n")
+
+na_summary <- function(df) {
+    df |>
+      dplyr::summarise(dplyr::across(everything(), \(x) round(mean(is.na(x)) * 100, 2))) |>
+      tidyr::pivot_longer(everything(), names_to = "variable", values_to = "pct_na") |>
+      dplyr::filter(pct_na > 0) |>
+      dplyr::arrange(dplyr::desc(pct_na))
+  }
+
+NA_distribution <- lapply(mats, na_summary) |> 
+  dplyr::bind_rows(.id = "matrix")
+NA_distribution |> 
+  knitr::kable(caption = "Missing Values distribution per matrix") |> 
+  kableExtra::kable_paper(full_width = FALSE, position = "center")
+  
+# Imputing missing values through kNN model with VIM package:
+
+matrices_with_na <- unique(NA_distribution$matrix)
+
+  mats[matrices_with_na] <- lapply(mats[matrices_with_na], function(df) {
+    meta   <- dplyr::select(df, where(Negate(is.numeric)))
+    feats  <- dplyr::select(df, where(is.numeric))
+    imputed <- as_tibble(VIM::kNN(feats, k = 10, imp_var = FALSE))
+    dplyr::bind_cols(meta, imputed)
+  })
+
+# NA Distribution after imputation
+NA_distribution <- lapply(mats, na_summary) |> 
+  dplyr::bind_rows(.id = "matrix")
+NA_distribution |> 
+  knitr::kable(caption = "Missing Values distribution after imputation per matrix") |> 
+  kableExtra::kable_paper(full_width = FALSE, position = "center")
+  
+```
+
 
 ## Helper: build mSet input
 
@@ -148,7 +212,7 @@ to_metabo_csv <- function(df) {
 The pipeline below covers the requested QC steps and the differential analysis:
 
 - **Dimensions / sanity:** `SanityCheckData()`
-- **Missing values:** `RemoveMissingPercent()` drops features with too many NAs.
+- **Missing values:** features with >50% NAs are dropped before `Read.TextData`.
 - **Imputation:** `ImputeMissingVar()`. Methods available include `"min"`
   (1/5 of the feature minimum, as in the lab's `ReplaceMin`), `"mean"`,
   `"median"`, `"knn_var"`, `"knn_smp"`, `"bpca"`, `"ppca"`, `"svdImpute"`,
@@ -167,8 +231,6 @@ The pipeline below covers the requested QC steps and the differential analysis:
 
 label <- "ADC1_Plasma"
 df <- mats$ADC1_Serum
-dpi <- 72
-default.dpi <- 72
 
 library(MetaboAnalystR)
 mSet <- InitDataObjects("conc", "stat", FALSE, default.dpi = dpi)
@@ -176,9 +238,13 @@ mSet <- InitDataObjects("conc", "stat", FALSE, default.dpi = dpi)
 # Run the full MetaboAnalystR QC + differential pipeline for one matrix.
 # Plots are written with absolute imgName into output/figures; MetaboAnalystR's
 # side-effect .qs files are contained in a per-run scratch dir.
-run_qc_diff <- function(df, label, impute = "min",
+run_qc_diff <- function(df, label, 
                         rowNorm = "NULL", transNorm = "LogNorm",
                         scaleNorm = "MeanCenter", dpi = 150) {
+  # drop features with >50% missing before MetaboAnalystR sees them
+  feat_cols <- setdiff(colnames(df), c("sample_id", "class"))
+  df <- df[, c("sample_id", "class", feat_cols[colMeans(is.na(df[feat_cols])) < 0.5])]
+
   csv <- to_metabo_csv(df)
 
   mSet <- InitDataObjects("conc", "stat", FALSE, default.dpi = dpi)
@@ -187,8 +253,6 @@ run_qc_diff <- function(df, label, impute = "min",
 
   # QC: sanity, missing values, imputation
   mSet <- SanityCheckData(mSet)
-  mSet <- RemoveMissingPercent(mSet, percent = 0.5)
-  mSet <- ImputeMissingVar(mSet, method = impute)
 
   # Normalization / transformation / scaling
   mSet <- PreparePrenormData(mSet)

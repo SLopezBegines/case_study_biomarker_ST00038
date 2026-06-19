@@ -4,7 +4,9 @@
 # Paths are absolute to the project root on this machine.
 # =============================================================================
 
-PROJ <- "/home/santi/github_repos/propietary/case_study_biomarker_ST000369"
+PROJ <- "/home/santi/github_repos/propietary/case_study_biomarker_ST000368"
+# Output locations for this notebook
+NB_OUT <- file.path(PROJ, "notebooks", "output", "ST000368")
 
 # NB_OUT should be personalized into the notebook
 RAW <- file.path(PROJ, "rawdata")
@@ -15,8 +17,9 @@ REP <- file.path(NB_OUT, "reports")
 RDAT <- file.path(NB_OUT, "RData")
 MET <- file.path(NB_OUT, "metabo")
 
-for (d in c(NB_OUT, DATA, FIG, TAB, REP, RDAT,  MET))
+for (d in c(NB_OUT, DATA, FIG, TAB, REP, RDAT, MET)) {
   dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
 
 # ==============================================================================
 # Global Variables
