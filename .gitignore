@@ -47,3 +47,6 @@ renv/local/
 renv/staging/
 renv/python/
 renv/sandbox/
+
+# Claude memory
+memory/
