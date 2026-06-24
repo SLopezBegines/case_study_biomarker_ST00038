@@ -72,7 +72,11 @@ cran_packages <- c(
   # Markdown tables
   "kableExtra",
   # Missing Values
-  "DataExplorer", "VIM"
+  "DataExplorer", "VIM",
+  # Differential analysis (non-MetaboAnalystR pipeline)
+  "pheatmap",      # heatmaps for significant metabolites
+  "factoextra",    # PCA biplots (ggplot2-based)
+  "broom"          # tidy model summaries
 )
 
 metaboanalyst_packages <- c(
@@ -80,7 +84,7 @@ metaboanalyst_packages <- c(
   "impute", "pcaMethods", "globaltest",
   "GlobalAncova", "Rgraphviz", "preprocessCore",
   "genefilter", "sva", "limma", "KEGGgraph", "siggenes", "BiocParallel", "MSnbase",
-  "multtest", "RBGL", "edgeR", "fgsea", "httr", "qs2",
+  "multtest", "RBGL", "edgeR", "fgsea", "httr", "qs2", "RSclient",
   # MetaboAnalystR itself (GitHub)
   "xia-lab/MetaboAnalystR"
 )
@@ -96,10 +100,12 @@ bioc_packages <- paste0("bioc::", c(
   "BiocParallel",
   "SummarizedExperiment",
   "S4Vectors",
+  "limma",           # moderated t-test for continuous -omics (metabolomics DE)
+  "edgeR",           # also used by limma helpers; kept here for explicit loading
   "EnhancedVolcano",
   "clusterProfiler", # GO enrichment
-  "STRINGdb", # STRING PPI database
-  "enrichplot", # GO enrichment visualization
+  "STRINGdb",        # STRING PPI database
+  "enrichplot",      # GO enrichment visualization
   "org.Hs.eg.db"
 ))
 load_pkgs(bioc_packages)
@@ -113,3 +119,4 @@ cat("Bioconductor version:", as.character(packageVersion("BiocManager")), "\n")
 rm(check_sysreqs, load_pkgs, cran_packages, metaboanalyst_packages, bioc_packages)
 
 # renv::snapshot(type = "all") # Uncomment to save package versions to renv.lock
+# install.packages("RSclient", repos = "http://www.rforge.net/")

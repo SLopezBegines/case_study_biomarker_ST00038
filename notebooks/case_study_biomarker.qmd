@@ -1,5 +1,5 @@
 ---
-title: "Case Study — Lung Adenocarcinoma Serum/Plasma Metabolomics: QC & Differential Analysis (MetaboAnalystR)"
+title: "Case Study — Lung Adenocarcinoma Serum/Plasma Metabolomics: QC & Differential Analysis"
 author: "Santiago López Begines"
 date: "`r Sys.Date()`"
 format:
@@ -19,76 +19,64 @@ format:
 ---
 
 ```{r setup, include=FALSE}
-# All comments in English.
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
 # Introduction
 
-This notebook is **Track A (univariate inferential / differential)** of the
-biomarker case study (see `docs/case_study_ML_biomarker_design.md`). It performs
-quality control (preprocessing, missing values, imputation, normalization) and
-differential analysis of **Adenocarcinoma vs Healthy** using **MetaboAnalystR**,
-following the lab's established `mSet` workflow.
+This notebook is **Track A (univariate differential analysis)** of the biomarker case
+study (see `docs/case_study_ML_biomarker_design.md`). It performs quality control,
+normalisation, and differential analysis of **Adenocarcinoma vs Healthy** using standard
+Bioconductor and CRAN packages (limma, ggplot2, pheatmap, factoextra).
 
-Data come from two GC-TOF-MS cohorts of the same project (PR000293):
+Data come from two GC-TOF-MS cohorts of project PR000293:
 **ADC1 = ST000368** (training) and **ADC2 = ST000369** (independent validation).
-Per the design, the differential is run **within ADC1**, **separately per
-biofluid** (Plasma, Serum), on the **137 metabolites shared** by both cohorts.
-Modelling per biofluid means one sample per patient, avoiding plasma–serum
-pairing leakage.
+Per the design, the differential is run **within ADC1 only**, **separately per biofluid**
+(Plasma, Serum), on the **137 metabolites shared** by both cohorts.
+
+**Normalisation pipeline:** median row-normalisation → Log2 transform → Pareto scaling
+(PCA only). **DE:** limma moderated t-test, model `~ class + smoker + gender`, FDR
+(Benjamini–Hochberg), threshold `adj.P < 0.05` and `|log2FC| > log2(FC_THRESH)`.
 
 # Setting up environment
 
 ```{r env}
-
-# Project parameters and paths
-source(file.path("..", "config", "params.R"))   # defines PROJ, DATA, FIG, TAB, REP, PARAMS
-
+source(file.path("..", "config", "params.R"))
 
 set.seed(PARAMS$seed)
 
-# Differential thresholds.
-# NOTE: in this blood metabolomics comparison effect sizes are small
-# (|log2FC| < ~0.25, i.e. FC < ~1.2), so a 1.5-2.0 fold-change cut-off 
-# removes essentially everything. Here significance
-# is FDR-led and the fold-change is treated as descriptive, with a light guide.
-FC_THRESH   <- 1.2    # descriptive fold-change guide (not a hard filter)
-PVAL_THRESH <- 0.05   # primary significance threshold (FDR-controlled)
+# Differential thresholds
+FC_THRESH   <- 1.2
+PVAL_THRESH <- 0.05
 
 # Libraries
-source(file.path(PROJ, "code","00_packages.R"))
+source(file.path(PROJ, "code", "00_packages.R"))
 
-# MetaboAnalystR is the engine for QC + differential. It is heavy and is
-# normally available in the analyst's environment. The notebook degrades
-# gracefully: if MetaboAnalystR is not installed, the MetaboAnalystR chunks
-# are skipped and an independent base-R differential cross-check still runs.
-HAS_METABO <- requireNamespace("MetaboAnalystR", quietly = TRUE)
-if (HAS_METABO) suppressMessages(library(MetaboAnalystR))
-# InitDataObjects reads default.dpi from .GlobalEnv; define it before any call.
-if (!exists("dpi")) dpi <- 150
-
-cat("MetaboAnalystR available:", HAS_METABO, "\n")
-
-# Aux functions
+# Normalisation + limma helpers (this analysis)
 source(file.path(PROJ, "code", "01_aux_functions.R"))
 source(file.path(PROJ, "code", "02_aux_metabolomics.R"))
 
+# Global output state used by save_plot() / save_table() / save_checkpoint()
+output_path  <- NB_OUT
+image_number <- 1
+
+# MetaboAnalystR is kept as optional; this notebook does not require it
+HAS_METABO <- requireNamespace("MetaboAnalystR", quietly = TRUE)
+if (HAS_METABO) suppressMessages(library(MetaboAnalystR))
+if (!exists("dpi")) dpi <- 150
+
+cat("MetaboAnalystR available:", HAS_METABO, "\n")
+cat("Output path:", output_path, "\n")
 ```
-
-
-
 
 # Loading data
 
-Build matrices
-```{r}
+```{r build-matrices}
 source(file.path(PROJ, "code", "03_build_matrices.R"))
 ```
 
-
-Pre-built analysis matrices are produced by `code/01_build_matrices.R`
-(run it first). Each file holds samples in rows: metadata columns
+Pre-built analysis matrices are produced by `code/03_build_matrices.R`.
+Each file holds samples in rows: metadata columns
 (`sample_id`, `cohort`, `biofluid`, `class`, `smoker`, `gender`) followed by the
 137 shared metabolites.
 
@@ -113,294 +101,558 @@ cat("Shared metabolites (features):", length(FEATURES), "\n")
 comp <- do.call(rbind, lapply(mats, function(d)
   as.data.frame(table(cohort = d$cohort, biofluid = d$biofluid, class = d$class))))
 comp <- comp[comp$Freq > 0, ]
-knitr::kable(comp, caption = "Composition: Adenocarcinoma vs Healthy by cohort and biofluid") |> 
+knitr::kable(comp, caption = "Composition: Adenocarcinoma vs Healthy by cohort and biofluid") |>
   kableExtra::kable_paper(full_width = FALSE, position = "center")
 ```
 
-The differential (Track A) uses the **ADC1** cohort, one model per biofluid.
+The differential (Track A) uses the **ADC1** cohort only, one model per biofluid.
 
-```{r}
-# Clean enviroment
-rm(adc1, adc2, fr, matrices, mdata.all, mdata.siggenes,obj, sample_sheet, shared_tbl)
+```{r clean-env}
+rm(list = intersect(
+  c("adc1","adc2","fr","matrices","mdata.all","mdata.siggenes",
+    "obj","sample_sheet","shared_tbl"),
+  ls()
+))
 ```
 
+# Quality Control
 
-# Quality Control (MetaboAnalystR)
-
-MetaboAnalystR expects a "samples-in-rows, unpaired" (`rowu`) table whose first
-column is the sample name, second column the class label, and remaining columns
-the metabolites. The helper below writes that table and walks the standard
-`mSet` QC sequence.
-Before generating `mSet` object, check missing values distribution 
 ## Missing values
 
-```{r}
-convert_to_factor <- function(df){
-df <- df |> 
-  dplyr::mutate(cohort = as.factor(cohort),
-                biofluid = as.factor(biofluid),
-                class = as.factor(class),
-                smoker = as.factor(smoker),
-                gender = as.factor(gender))
+```{r missing-values}
+convert_to_factor <- function(df) {
+  df |>
+    dplyr::mutate(
+      cohort   = as.factor(cohort),
+      biofluid = as.factor(biofluid),
+      class    = as.factor(class),
+      smoker   = as.factor(smoker),
+      gender   = as.factor(gender)
+    )
 }
-
 mats <- lapply(mats, convert_to_factor)
 
-```
-
-```{r}
-# Check NA distribution
-
-cat("Missing Values presence: \n")
-cat("ADC1_Plasma: ", anyNA(mats$ADC1_Plasma), "\n")
-cat("ADC1_Serum: ", anyNA(mats$ADC1_Serum), "\n")
-cat("ADC2_Plasma: ", anyNA(mats$ADC2_Plasma), "\n")
-cat("ADC2_Serum: ", anyNA(mats$ADC2_Serum), "\n")
+cat("Missing values present:\n")
+for (nm in names(mats)) cat(" ", nm, ":", anyNA(mats[[nm]]), "\n")
 
 na_summary <- function(df) {
-    df |>
-      dplyr::summarise(dplyr::across(everything(), \(x) round(mean(is.na(x)) * 100, 2))) |>
-      tidyr::pivot_longer(everything(), names_to = "variable", values_to = "pct_na") |>
-      dplyr::filter(pct_na > 0) |>
-      dplyr::arrange(dplyr::desc(pct_na))
+  df |>
+    dplyr::summarise(dplyr::across(dplyr::everything(),
+                                    \(x) round(mean(is.na(x)) * 100, 2))) |>
+    tidyr::pivot_longer(dplyr::everything(),
+                        names_to = "variable", values_to = "pct_na") |>
+    dplyr::filter(pct_na > 0) |>
+    dplyr::arrange(dplyr::desc(pct_na))
+}
+
+NA_distribution <- dplyr::bind_rows(lapply(mats, na_summary), .id = "matrix")
+NA_distribution |>
+  knitr::kable(caption = "Missing values (%) per variable and matrix") |>
+  kableExtra::kable_paper(full_width = FALSE, position = "center")
+
+# kNN imputation (k = 10) on numeric feature columns only
+matrices_with_na <- unique(NA_distribution$matrix)
+mats[matrices_with_na] <- lapply(mats[matrices_with_na], function(df) {
+  meta   <- dplyr::select(df, dplyr::where(Negate(is.numeric)))
+  feats  <- dplyr::select(df, dplyr::where(is.numeric))
+  imputed <- tibble::as_tibble(VIM::kNN(feats, k = 10, imp_var = FALSE))
+  dplyr::bind_cols(meta, imputed)
+})
+
+NA_distribution_post <- dplyr::bind_rows(lapply(mats, na_summary), .id = "matrix")
+if (nrow(NA_distribution_post) == 0) {
+  cat("All missing values successfully imputed.\n")
+} else {
+  NA_distribution_post |>
+    knitr::kable(caption = "Remaining missing values after imputation") |>
+    kableExtra::kable_paper(full_width = FALSE, position = "center")
+}
+```
+
+## Feature preparation
+
+Restrict to ADC1. Remove features with constant or near-zero variance (CV < 10 %).
+
+```{r feature-prep}
+# ADC1 only
+adc1 <- list(
+  ADC1_Plasma = mats$ADC1_Plasma,
+  ADC1_Serum  = mats$ADC1_Serum
+)
+
+# Extract feature sub-matrices to check variance before normalisation
+feat_counts <- lapply(names(adc1), function(nm) {
+  df        <- adc1[[nm]]
+  feat_cols <- intersect(FEATURES, colnames(df))
+  raw_mat   <- as.matrix(df[, feat_cols, drop = FALSE])
+  storage.mode(raw_mat) <- "double"
+  cv  <- apply(raw_mat, 2, function(x) sd(x, na.rm=TRUE) / abs(mean(x, na.rm=TRUE)))
+  n_low_var <- sum(cv < 0.10, na.rm = TRUE)
+  data.frame(
+    matrix          = nm,
+    n_samples       = nrow(raw_mat),
+    n_features_raw  = ncol(raw_mat),
+    n_low_var_removed = n_low_var,
+    n_features_kept = ncol(raw_mat) - n_low_var
+  )
+})
+
+do.call(rbind, feat_counts) |>
+  knitr::kable(caption = "Feature count before/after low-variance filter") |>
+  kableExtra::kable_paper(full_width = FALSE, position = "center")
+```
+
+# Normalisation
+
+## Pipeline
+
+Median row normalisation → Log2 transform → Pareto scaling (PCA only).
+The log2 transform is used so that limma's logFC is directly in log2 units
+(threshold: `|log2FC| > log2(FC_THRESH)` ≈ `r round(log2(FC_THRESH), 3)`).
+
+```{r normalise, cache=TRUE}
+if (check_checkpoint("norm_results")) {
+  prep_res <- load_checkpoint("norm_results")
+} else {
+  prep_res <- lapply(names(adc1), function(nm) {
+    feat_cols <- intersect(FEATURES, colnames(adc1[[nm]]))
+    prepare_matrix(adc1[[nm]], feat_cols = feat_cols, meta_cols = META_COLS)
+  })
+  names(prep_res) <- names(adc1)
+  save_checkpoint(prep_res, "norm_results")
+}
+
+# Dimensions after normalisation
+for (nm in names(prep_res)) {
+  cat(nm, "— DE matrix:", nrow(prep_res[[nm]]$mat_de),
+      "samples ×", ncol(prep_res[[nm]]$mat_de), "features\n")
+}
+```
+
+## Normalisation QC plots
+
+Density (all features, per sample) and per-sample boxplots before and after log2 transform.
+
+```{r norm-qc-plots, fig.width=14, fig.height=10}
+make_norm_qc <- function(raw_mat, log2_mat, meta, label) {
+  cls <- as.character(meta$class[match(rownames(raw_mat), meta$sample_id)])
+
+  # Long format helpers
+  to_long <- function(mat, stage) {
+    df <- as.data.frame(mat)
+    df$sample <- rownames(df)
+    df$class  <- cls
+    df$stage  <- stage
+    tidyr::pivot_longer(df, -c(sample, class, stage),
+                        names_to = "feature", values_to = "value")
   }
 
-NA_distribution <- lapply(mats, na_summary) |> 
-  dplyr::bind_rows(.id = "matrix")
-NA_distribution |> 
-  knitr::kable(caption = "Missing Values distribution per matrix") |> 
+  raw_long  <- to_long(raw_mat,  "Raw (imputed)")
+  log2_long <- to_long(log2_mat, "Log2")
+
+  # Random 30 features for boxplots
+  set.seed(PARAMS$seed)
+  feat_sub  <- sample(colnames(raw_mat), min(30L, ncol(raw_mat)))
+
+  # Density of sample means (before vs after)
+  mean_df <- dplyr::bind_rows(
+    raw_long  |> dplyr::summarise(mean_val = mean(value, na.rm=TRUE),
+                                   .by = c(sample, class, stage)),
+    log2_long |> dplyr::summarise(mean_val = mean(value, na.rm=TRUE),
+                                   .by = c(sample, class, stage))
+  ) |> dplyr::mutate(stage = factor(stage, levels = c("Raw (imputed)", "Log2")))
+
+  p_density <- ggplot2::ggplot(mean_df,
+                                ggplot2::aes(x = mean_val, colour = class,
+                                             linetype = stage)) +
+    ggplot2::geom_density(linewidth = 0.9) +
+    ggplot2::scale_colour_manual(values = c(Adenocarcinoma = "firebrick3",
+                                             Healthy = "steelblue4")) +
+    ggplot2::facet_wrap(~stage, scales = "free_x") +
+    ggplot2::labs(title = paste("Sample-mean density —", label),
+                  x = "Mean intensity", y = "Density",
+                  colour = "Class", linetype = "Stage") +
+    ggplot2::theme_bw()
+
+  # Per-sample boxplot after log2 (coloured by class)
+  log2_sub  <- log2_long |> dplyr::filter(feature %in% feat_sub)
+  p_box <- ggplot2::ggplot(log2_sub,
+                            ggplot2::aes(x = sample, y = value, fill = class)) +
+    ggplot2::geom_boxplot(outlier.size = 0.3, linewidth = 0.3) +
+    ggplot2::scale_fill_manual(values = c(Adenocarcinoma = "firebrick3",
+                                           Healthy = "steelblue4")) +
+    ggplot2::labs(title = paste("Per-sample distribution (log2, 30 features) —", label),
+                  x = NULL, y = "log2 intensity", fill = "Class") +
+    ggplot2::theme_bw() +
+    ggplot2::theme(axis.text.x = ggplot2::element_blank(),
+                   axis.ticks.x = ggplot2::element_blank())
+
+  patchwork::wrap_plots(p_density, p_box, ncol = 1, heights = c(1, 1.5))
+}
+
+for (nm in names(prep_res)) {
+  p <- make_norm_qc(
+    raw_mat  = prep_res[[nm]]$raw,
+    log2_mat = prep_res[[nm]]$mat_de,
+    meta     = prep_res[[nm]]$meta,
+    label    = nm
+  )
+  print(p)
+  save_plot(paste0("norm_qc_", nm), p, width = 12, height = 9, subdir = "QC")
+}
+```
+
+# Exploratory Data Analysis
+
+## Feature distributions
+
+```{r eda-distributions, fig.width=12, fig.height=8}
+# Top 30 variable features per matrix (Pareto-scaled, for visualisation)
+for (nm in names(prep_res)) {
+  var_rank <- sort(apply(prep_res[[nm]]$mat_pca, 2, var, na.rm=TRUE),
+                   decreasing = TRUE)
+  top30    <- names(var_rank)[seq_len(min(30L, length(var_rank)))]
+
+  long_df <- as.data.frame(prep_res[[nm]]$mat_pca[, top30]) |>
+    tibble::rownames_to_column("sample_id") |>
+    dplyr::left_join(
+      dplyr::select(prep_res[[nm]]$meta, sample_id, class),
+      by = "sample_id"
+    ) |>
+    tidyr::pivot_longer(-c(sample_id, class),
+                        names_to = "feature", values_to = "value") |>
+    dplyr::mutate(feature = stringr::str_trunc(feature, 20))
+
+  p <- ggplot2::ggplot(long_df,
+                        ggplot2::aes(x = value, fill = class)) +
+    ggplot2::geom_histogram(bins = 20, alpha = 0.7, position = "identity") +
+    ggplot2::scale_fill_manual(values = c(Adenocarcinoma = "firebrick3",
+                                           Healthy = "steelblue4")) +
+    ggplot2::facet_wrap(~feature, scales = "free", ncol = 6) +
+    ggplot2::labs(title = paste("Top 30 variable features (Pareto-scaled) —", nm),
+                  x = "Pareto-scaled log2 intensity", y = "Count", fill = "Class") +
+    ggplot2::theme_bw(base_size = 8) +
+    ggplot2::theme(legend.position = "bottom")
+
+  print(p)
+  save_plot(paste0("eda_distributions_", nm), p,
+            width = 14, height = 10, subdir = "EDA")
+}
+```
+
+## Feature correlation
+
+```{r eda-correlation, fig.width=10, fig.height=9}
+for (nm in names(prep_res)) {
+  var_rank <- sort(apply(prep_res[[nm]]$mat_de, 2, var, na.rm=TRUE),
+                   decreasing = TRUE)
+  top30 <- names(var_rank)[seq_len(min(30L, length(var_rank)))]
+
+  p_corr <- DataExplorer::plot_correlation(
+    as.data.frame(prep_res[[nm]]$mat_de[, top30]),
+    title = paste("Feature correlation (top 30, log2) —", nm)
+  )
+  print(p_corr)
+  save_plot(paste0("eda_correlation_", nm), p_corr,
+            width = 10, height = 9, subdir = "EDA")
+}
+```
+
+# Principal Component Analysis
+
+```{r pca-analysis, fig.width=14, fig.height=12}
+pca_results <- list()
+
+for (nm in names(prep_res)) {
+  mat_pca <- prep_res[[nm]]$mat_pca
+  meta    <- prep_res[[nm]]$meta
+  cls     <- meta$class[match(rownames(mat_pca), meta$sample_id)]
+
+  pca_obj <- prcomp(mat_pca, center = FALSE, scale. = FALSE)
+  pca_results[[nm]] <- pca_obj
+
+  # Variance explained
+  pct_var <- round(100 * pca_obj$sdev^2 / sum(pca_obj$sdev^2), 1)
+
+  # Scree plot
+  p_scree <- factoextra::fviz_eig(
+    pca_obj, addlabels = TRUE, ncp = min(10L, ncol(mat_pca)),
+    barfill = "steelblue4", barcolor = "steelblue4"
+  ) +
+    ggplot2::labs(title = paste("Scree plot —", nm)) +
+    ggplot2::theme_bw()
+
+  # Score plot (PC1 × PC2)
+  p_score <- factoextra::fviz_pca_ind(
+    pca_obj,
+    geom.ind     = "point",
+    col.ind      = cls,
+    palette      = c(Adenocarcinoma = "firebrick3", Healthy = "steelblue4"),
+    addEllipses  = TRUE,
+    ellipse.level = 0.95,
+    legend.title = "Class",
+    title        = paste("PCA Score Plot (PC1 × PC2) —", nm)
+  ) +
+    ggplot2::labs(
+      x = paste0("PC1 (", pct_var[1], "%)"),
+      y = paste0("PC2 (", pct_var[2], "%)")
+    ) +
+    ggplot2::theme_bw()
+
+  # Biplot (top 15 loading vectors)
+  p_biplot <- factoextra::fviz_pca_biplot(
+    pca_obj,
+    geom.ind     = "point",
+    col.ind      = cls,
+    col.var      = "grey40",
+    palette      = c(Adenocarcinoma = "firebrick3", Healthy = "steelblue4"),
+    addEllipses  = TRUE,
+    ellipse.level = 0.95,
+    select.var   = list(contrib = 15),
+    repel        = TRUE,
+    label        = "var",
+    legend.title = "Class",
+    title        = paste("PCA Biplot (top 15 loadings) —", nm)
+  ) +
+    ggplot2::labs(
+      x = paste0("PC1 (", pct_var[1], "%)"),
+      y = paste0("PC2 (", pct_var[2], "%)")
+    ) +
+    ggplot2::theme_bw()
+
+  combined <- (p_scree + p_score) / p_biplot +
+    patchwork::plot_annotation(title = nm,
+                               theme = ggplot2::theme(
+                                 plot.title = ggplot2::element_text(size = 14,
+                                                                     face = "bold")))
+  print(combined)
+  save_plot(paste0("pca_", nm), combined, width = 14, height = 12, subdir = "PCA")
+}
+```
+
+# Covariate Assessment
+
+Balance check and aliasing test for `smoker` and `gender` vs `class`.
+
+```{r covariate-check}
+for (nm in names(prep_res)) {
+  cat("\n===", nm, "===\n")
+  check_covariates(prep_res[[nm]]$meta)
+}
+```
+
+# Differential Analysis
+
+## limma model: `~ class + smoker + gender`
+
+```{r limma-de, cache=TRUE}
+if (check_checkpoint("de_results")) {
+  de_results <- load_checkpoint("de_results")
+} else {
+  de_results <- lapply(names(prep_res), function(nm) {
+    run_limma_de(
+      mat_de = prep_res[[nm]]$mat_de,
+      meta   = prep_res[[nm]]$meta,
+      label  = nm
+    )
+  })
+  names(de_results) <- names(prep_res)
+  save_checkpoint(de_results, "de_results")
+}
+```
+
+## Results tables
+
+```{r de-tables}
+fc_thresh_log2 <- log2(FC_THRESH)
+
+for (nm in names(de_results)) {
+  de <- de_results[[nm]]
+  n_sig <- sum(de$significant, na.rm = TRUE)
+  n_up  <- sum(de$significant & de$logFC > 0, na.rm = TRUE)
+  n_dn  <- sum(de$significant & de$logFC < 0, na.rm = TRUE)
+
+  cat(sprintf("\n%s — %d significant (↑%d, ↓%d) at FDR < %.2f & |log2FC| > %.3f\n",
+              nm, n_sig, n_up, n_dn, PVAL_THRESH, fc_thresh_log2))
+
+  de |>
+    dplyr::filter(significant) |>
+    dplyr::select(metabolite, logFC, t_stat, p_value, adj_p_value) |>
+    dplyr::mutate(dplyr::across(where(is.numeric), \(x) round(x, 4))) |>
+    knitr::kable(caption = paste("Significant metabolites —", nm)) |>
+    kableExtra::kable_paper(full_width = FALSE, position = "center") |>
+    print()
+
+  save_table(de, paste0("limma_de_", nm), subdir = "DE/")
+}
+```
+
+## Summary across matrices
+
+```{r de-summary}
+all_de <- dplyr::bind_rows(de_results)
+
+summary_tbl <- all_de |>
+  dplyr::group_by(label) |>
+  dplyr::summarise(
+    n_tested    = dplyr::n(),
+    n_sig       = sum(significant, na.rm = TRUE),
+    n_up        = sum(significant & logFC > 0, na.rm = TRUE),
+    n_down      = sum(significant & logFC < 0, na.rm = TRUE),
+    top_up      = metabolite[which.max(ifelse(significant, logFC,  -Inf))],
+    top_down    = metabolite[which.min(ifelse(significant, logFC,   Inf))],
+    .groups     = "drop"
+  )
+
+summary_tbl |>
+  knitr::kable(caption = "Differential analysis summary (ADC1 cohort)") |>
   kableExtra::kable_paper(full_width = FALSE, position = "center")
-  
-# Imputing missing values through kNN model with VIM package:
+```
 
-matrices_with_na <- unique(NA_distribution$matrix)
+# Visualisation
 
-  mats[matrices_with_na] <- lapply(mats[matrices_with_na], function(df) {
-    meta   <- dplyr::select(df, where(Negate(is.numeric)))
-    feats  <- dplyr::select(df, where(is.numeric))
-    imputed <- as_tibble(VIM::kNN(feats, k = 10, imp_var = FALSE))
-    dplyr::bind_cols(meta, imputed)
+## Volcano plots
+
+```{r volcano-plots, fig.width=12, fig.height=6}
+make_volcano <- function(de, label) {
+  fc_thresh_log2 <- log2(FC_THRESH)
+
+  de <- de |>
+    dplyr::mutate(
+      status = dplyr::case_when(
+        significant & logFC >  fc_thresh_log2 ~ "Up",
+        significant & logFC < -fc_thresh_log2 ~ "Down",
+        TRUE ~ "NS"
+      )
+    )
+
+  label_df <- de |>
+    dplyr::filter(significant) |>
+    dplyr::slice_min(adj_p_value, n = 20, with_ties = FALSE)
+
+  ggplot2::ggplot(de, ggplot2::aes(x = logFC,
+                                    y = -log10(adj_p_value),
+                                    colour = status)) +
+    ggplot2::geom_point(alpha = 0.65, size = 1.8) +
+    ggrepel::geom_label_repel(
+      data    = label_df,
+      mapping = ggplot2::aes(label = metabolite),
+      size    = 2.5, max.overlaps = 25, box.padding = 0.3,
+      show.legend = FALSE
+    ) +
+    ggplot2::geom_vline(xintercept = c(-fc_thresh_log2, fc_thresh_log2),
+                        linetype = "dashed", colour = "grey50", linewidth = 0.5) +
+    ggplot2::geom_hline(yintercept = -log10(PVAL_THRESH),
+                        linetype = "dashed", colour = "grey50", linewidth = 0.5) +
+    ggplot2::scale_colour_manual(
+      values = c(Up = "firebrick3", Down = "steelblue4", NS = "grey75"),
+      guide  = ggplot2::guide_legend(override.aes = list(size = 3))
+    ) +
+    ggplot2::labs(
+      title   = paste("Volcano plot —", label),
+      subtitle = sprintf("Model: ~ class + smoker + gender | FDR < %.2f, |log2FC| > %.3f",
+                         PVAL_THRESH, fc_thresh_log2),
+      x       = expression(log[2]~FC~(ADC / Healthy)),
+      y       = expression(-log[10]~(FDR~adjusted~p)),
+      colour  = NULL
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(legend.position = "right")
+}
+
+volcano_plots <- lapply(names(de_results), function(nm) {
+  make_volcano(de_results[[nm]], nm)
+})
+names(volcano_plots) <- names(de_results)
+
+combined_volcano <- patchwork::wrap_plots(volcano_plots, ncol = 2)
+print(combined_volcano)
+save_plot("volcano_ADC1", combined_volcano, width = 14, height = 7, subdir = "DE")
+```
+
+## Heatmaps of significant metabolites
+
+```{r heatmaps, fig.width=10, fig.height=8}
+for (nm in names(de_results)) {
+  de  <- de_results[[nm]]
+  sig <- de |> dplyr::filter(significant) |> dplyr::pull(metabolite)
+
+  if (length(sig) == 0) {
+    message("No significant metabolites for ", nm, " — skipping heatmap.")
+    next
+  }
+
+  mat_h <- t(prep_res[[nm]]$mat_de[, sig, drop = FALSE])   # features × samples
+  meta_h <- prep_res[[nm]]$meta
+  meta_h <- meta_h[match(colnames(mat_h), meta_h$sample_id), , drop = FALSE]
+
+  annot_col <- data.frame(
+    Class  = meta_h$class,
+    Smoker = meta_h$smoker,
+    Gender = meta_h$gender,
+    row.names = meta_h$sample_id
+  )
+
+  cls_pal    <- c("firebrick3", "steelblue4")
+  names(cls_pal) <- levels(factor(meta_h$class))
+  smk_levels <- levels(factor(meta_h$smoker))
+  smk_pal    <- setNames(
+    RColorBrewer::brewer.pal(max(3L, length(smk_levels)), "Dark2")[seq_along(smk_levels)],
+    smk_levels
+  )
+  gen_pal    <- c(F = "#e7298a", M = "#1f78b4")
+
+  annot_colors <- list(Class = cls_pal, Smoker = smk_pal, Gender = gen_pal)
+  annot_colors <- lapply(annot_colors, function(pal) {
+    pal[names(pal) %in% levels(factor(unlist(annot_col)))]
   })
 
-# NA Distribution after imputation
-NA_distribution <- lapply(mats, na_summary) |> 
-  dplyr::bind_rows(.id = "matrix")
-NA_distribution |> 
-  knitr::kable(caption = "Missing Values distribution after imputation per matrix") |> 
-  kableExtra::kable_paper(full_width = FALSE, position = "center")
-  
-```
+  heat_fn <- function() {
+    pheatmap::pheatmap(
+      mat_h,
+      annotation_col    = annot_col,
+      annotation_colors = annot_colors,
+      scale             = "row",
+      show_colnames     = FALSE,
+      clustering_method = "ward.D2",
+      color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+      main  = paste("Significant metabolites (row-scaled) —", nm),
+      fontsize_row = max(6, 11 - length(sig) %/% 10)
+    )
+  }
 
-
-## Helper: build mSet input
-
-```{r helper-input}
-# Convert an analysis matrix to MetaboAnalystR 'rowu' input and write a temp CSV.
-to_metabo_csv <- function(df) {
-  out <- data.frame(Sample = df$sample_id,
-                    Label  = as.character(df$class),
-                    check.names = FALSE)
-  out <- cbind(out, df[, intersect(FEATURES, colnames(df)), drop = FALSE])
-  f <- tempfile(fileext = ".csv")
-  write.csv(out, f, row.names = FALSE)
-  f
+  save_plot(paste0("heatmap_", nm), heat_fn,
+            width = 10, height = max(6, length(sig) * 0.28 + 3),
+            subdir = "DE")
+  heat_fn()   # render inline
 }
 ```
 
-## QC + Differential pipeline (mSet)
+# Results summary
 
-The pipeline below covers the requested QC steps and the differential analysis:
+```{r results-summary}
+# Overlap between Plasma and Serum significant metabolites
+sig_plasma <- de_results$ADC1_Plasma |>
+  dplyr::filter(significant) |> dplyr::pull(metabolite)
+sig_serum  <- de_results$ADC1_Serum  |>
+  dplyr::filter(significant) |> dplyr::pull(metabolite)
 
-- **Dimensions / sanity:** `SanityCheckData()`
-- **Missing values:** features with >50% NAs are dropped before `Read.TextData`.
-- **Imputation:** `ImputeMissingVar()`. Methods available include `"min"`
-  (1/5 of the feature minimum, as in the lab's `ReplaceMin`), `"mean"`,
-  `"median"`, `"knn_var"`, `"knn_smp"`, `"bpca"`, `"ppca"`, `"svdImpute"`,
-  `"rf"`. Here GC-TOF-MS missingness is low (<4% per feature), so a simple
-  `"min"` replacement is appropriate; `"knn_var"` is a reasonable alternative.
-- **Normalization / transformation / scaling:** `Normalization(rowNorm,
-  transNorm, scaleNorm)`. Row options include `"NULL"`, `"SumNorm"`,
-  `"MedianNorm"`, `"QuantileNorm"`; transform `"LogNorm"`/`"CrNorm"`;
-  scale `"MeanCenter"`, `"AutoNorm"` (unit variance), `"ParetoNorm"`,
-  `"RangeNorm"`. The data are already BinBase-processed, so no row
-  normalization is applied; we use **LogNorm + MeanCenter** (the lab default).
-- **PCA / clustering** for outlier and structure inspection.
-- **Differential:** fold-change, t-test (FDR), and volcano.
+overlap <- intersect(sig_plasma, sig_serum)
 
-```{r metabo-pipeline, eval=HAS_METABO}
+cat(sprintf(
+  "ADC1 Plasma: %d significant\nADC1 Serum:  %d significant\nOverlap:     %d (%s)\n",
+  length(sig_plasma), length(sig_serum), length(overlap),
+  if (length(overlap) > 0) paste(overlap, collapse = ", ") else "none"
+))
 
-label <- "ADC1_Plasma"
-df <- mats$ADC1_Serum
-
-library(MetaboAnalystR)
-mSet <- InitDataObjects("conc", "stat", FALSE, default.dpi = dpi)
-
-# Run the full MetaboAnalystR QC + differential pipeline for one matrix.
-# Plots are written with absolute imgName into output/figures; MetaboAnalystR's
-# side-effect .qs files are contained in a per-run scratch dir.
-run_qc_diff <- function(df, label, 
-                        rowNorm = "NULL", transNorm = "LogNorm",
-                        scaleNorm = "MeanCenter", dpi = 150) {
-  # drop features with >50% missing before MetaboAnalystR sees them
-  feat_cols <- setdiff(colnames(df), c("sample_id", "class"))
-  df <- df[, c("sample_id", "class", feat_cols[colMeans(is.na(df[feat_cols])) < 0.5])]
-
-  csv <- to_metabo_csv(df)
-
-  mSet <- InitDataObjects("conc", "stat", FALSE, default.dpi = dpi)
-  mSet <- Read.TextData(mSet, csv, "rowu", "disc")
-  unlink(csv)
-
-  # QC: sanity, missing values, imputation
-  mSet <- SanityCheckData(mSet)
-
-  # Normalization / transformation / scaling
-  mSet <- PreparePrenormData(mSet)
-  mSet <- Normalization(mSet, rowNorm, transNorm, scaleNorm, ratio = FALSE)
-  mSet <- PlotNormSummary(mSet, file.path(FIG, paste0("metabo_", label, "_norm")),
-                          "png", dpi, width = NA)
-  mSet <- PlotSampleNormSummary(mSet,
-                          file.path(FIG, paste0("metabo_", label, "_sample_norm")),
-                          "png", dpi, width = NA)
-
-  # PCA (outlier / structure inspection)
-  mSet <- PCA.Anal(mSet)
-  mSet <- PlotPCA2DScore(mSet, file.path(FIG, paste0("metabo_", label, "_pca2d")),
-                         "png", dpi, width = NA, 1, 2, 0.95, 1, 0)
-
-  # Differential: fold-change, t-test (FDR), volcano
-  mSet <- FC.Anal.unpaired(mSet, FC_THRESH, FALSE)
-  mSet <- Ttests.Anal(mSet, nonpar = FALSE, threshp = PVAL_THRESH,
-                      paired = FALSE, equal.var = TRUE, pvalType = "fdr")
-  mSet <- Volcano.Anal(mSet, paired = FALSE, fcthresh = FC_THRESH, cmpType = 1,
-                       nonpar = FALSE, threshp = PVAL_THRESH, equal.var = TRUE,
-                       pval.type = "fdr")
-  mSet <- PlotVolcano(mSet, file.path(FIG, paste0("metabo_", label, "_volcano")),
-                      1, 0, "png", dpi, width = NA)
-
-  # Export the differential statistics table.
-  # Join by name to avoid positional mis-pairing if fc and tt slot orders differ.
-  tt_df <- data.frame(
-    metabolite = names(mSet$analSet$tt$p.value),
-    t_score    = as.numeric(mSet$analSet$tt$t.score),
-    fdr        = as.numeric(mSet$analSet$tt$p.value),
-    stringsAsFactors = FALSE)
-  fc_df <- data.frame(
-    metabolite = names(mSet$analSet$fc$fc.log),
-    log2FC     = as.numeric(mSet$analSet$fc$fc.log),
-    stringsAsFactors = FALSE)
-  stat <- merge(tt_df, fc_df, by = "metabolite", all.x = TRUE)
-  stat <- stat[order(stat$fdr), c("metabolite", "log2FC", "t_score", "fdr")]
-  write.csv(stat, file.path(TAB, paste0("differential_metabo_", label, ".csv")),
-            row.names = FALSE)
-  saveRDS(mSet, file.path(NB_OUT, "metabo", paste0("mSet_", label, ".rds")))
-  list(mSet = mSet, stat = stat)
-}
-
-res_plasma <- run_qc_diff(mats$ADC1_Plasma, "ADC1_Plasma")
-res_serum  <- run_qc_diff(mats$ADC1_Serum,  "ADC1_Serum")
-
-knitr::kable(head(res_plasma$stat, 15),
-             caption = "ADC1 Plasma — top differential metabolites (MetaboAnalystR)")
-knitr::kable(head(res_serum$stat, 15),
-             caption = "ADC1 Serum — top differential metabolites (MetaboAnalystR)")
+# Export full combined DE table
+save_table(dplyr::bind_rows(de_results), "limma_de_ADC1_combined", subdir = "DE/")
+save_checkpoint(de_results, "de_results_final")
+save_checkpoint(prep_res,   "prep_results_final")
 ```
 
-```{r metabo-volcano-show, eval=HAS_METABO, echo=FALSE}
-# Embed the MetaboAnalystR volcano plots if they were produced.
-vfiles <- list.files(FIG, pattern = "metabo_ADC1_(Plasma|Serum)_volcano.*\\.png$",
-                     full.names = TRUE)
-if (length(vfiles)) knitr::include_graphics(vfiles)
-```
+# Session information
 
-# Differential analysis — independent base-R cross-check
-
-This section is **engine-independent**: it reproduces the differential with base
-R (log10 transform, Welch t-test per metabolite, Benjamini–Hochberg FDR,
-log2 fold-change of group means). It always runs, validates the MetaboAnalystR
-result, and renders even when MetaboAnalystR is unavailable.
-
-```{r base-diff}
-# Per-metabolite differential for one matrix: Adenocarcinoma vs Healthy.
-diff_base <- function(df) {
-  X  <- as.matrix(df[, FEATURES, drop = FALSE])
-  Xl <- log10(X + 1)                              # stabilise variance
-  cls <- factor(df$class,
-                levels = c(PARAMS$negative_class, PARAMS$positive_class))
-  pos <- cls == PARAMS$positive_class             # Adenocarcinoma
-  neg <- cls == PARAMS$negative_class             # Healthy
-  res <- t(apply(Xl, 2, function(v) {
-    tt <- tryCatch(t.test(v[pos], v[neg]), error = function(e) NULL)
-    c(log2FC = mean(v[pos], na.rm = TRUE) - mean(v[neg], na.rm = TRUE),
-      p      = if (is.null(tt)) NA else tt$p.value)
-  }))
-  out <- data.frame(metabolite = rownames(res),
-                    log2FC = res[, "log2FC"],
-                    p_value = res[, "p"], row.names = NULL)
-  out$FDR <- p.adjust(out$p_value, method = "BH")
-  out[order(out$p_value), ]
-}
-
-diff_plasma <- diff_base(mats$ADC1_Plasma)
-diff_serum  <- diff_base(mats$ADC1_Serum)
-
-write.csv(diff_plasma, file.path(TAB, "differential_baseR_ADC1_Plasma.csv"), row.names = FALSE)
-write.csv(diff_serum,  file.path(TAB, "differential_baseR_ADC1_Serum.csv"),  row.names = FALSE)
-
-cat(sprintf("ADC1 Plasma: %d/%d metabolites with FDR < %.2f\n",
-            sum(diff_plasma$FDR < PVAL_THRESH, na.rm = TRUE), nrow(diff_plasma), PVAL_THRESH))
-cat(sprintf("ADC1 Serum : %d/%d metabolites with FDR < %.2f\n",
-            sum(diff_serum$FDR < PVAL_THRESH, na.rm = TRUE), nrow(diff_serum), PVAL_THRESH))
-
-knitr::kable(head(diff_plasma, 15), caption = "ADC1 Plasma — top differential (base-R cross-check)")
-knitr::kable(head(diff_serum, 15),  caption = "ADC1 Serum — top differential (base-R cross-check)")
-```
-
-# Visualization — volcano (base-R cross-check)
-
-```{r base-volcano, fig.width=11, fig.height=5.5}
-volcano_base <- function(d, title, fc = log2(FC_THRESH), p = PVAL_THRESH) {
-  lp  <- -log10(d$p_value)
-  # Significance is FDR-led; fold-change lines are descriptive guides only.
-  sig <- d$FDR < p
-  col <- ifelse(sig & d$log2FC > 0, "#e41a1c",
-         ifelse(sig & d$log2FC < 0, "#377eb8", "grey70"))
-  plot(d$log2FC, lp, pch = 19, cex = 0.8, col = col,
-       xlab = "log2 fold-change (Adenocarcinoma / Healthy)",
-       ylab = "-log10 p-value", main = title)
-  abline(h = -log10(p), lty = 2, col = "grey50")
-  abline(v = c(-fc, fc), lty = 2, col = "grey50")
-  k <- which(sig); k <- k[order(d$p_value[k])][seq_len(min(8, length(k)))]
-  if (length(k)) text(d$log2FC[k], lp[k], d$metabolite[k], cex = 0.6, pos = 3)
-}
-par(mfrow = c(1, 2))
-volcano_base(diff_plasma, "ADC1 Plasma")
-volcano_base(diff_serum,  "ADC1 Serum")
-```
-
-> Note on expectations: the EDA (Stage 1) showed the cancer-vs-healthy signal is
-> weak relative to batch and biofluid structure (PC R²_class ≤ 0.06). A modest
-> number of FDR-significant metabolites is therefore expected; this is an honest
-> reflection of the biology, not an analytical failure.
-
-# Feature Selection
-
-Out of scope for Track A. Multivariate feature selection (LASSO / elastic net
-with in-fold selection) is part of **Track B (predictive, Python)**; see the
-design document.
-
-# Modeling
-
-Out of scope here. Track B trains per-biofluid classifiers on ADC1 and validates
-once on ADC2 (138 → 137 shared metabolites).
-
-# Model Evaluation
-
-Out of scope here. See Track B for external-validation metrics (AUROC, AUPRC,
-balanced accuracy) and the Track A vs Track B synthesis.
-
----
-
-*Engine: MetaboAnalystR (QC + differential), mirrored from the lab's
-`r_projects/metabolomic` workflow. Differential cross-checked with base R.*
+```{r session-info}
+sessionInfo()
 ```

@@ -1,91 +1,9 @@
-# I/O helpers for Metabolomics Workbench REST "MSdata" tables.
-# Format: row 1 = header (Metabolite_name, RefMet_name, <sample IDs...>);
-#         one row labelled "Factors" holding "Key:Value | Key:Value | ..."
-#         per sample; remaining rows = one identified metabolite each.
-# All comments in English.
-
-# Parse a single Factors cell like
-#   "Organ:Plasma | Cancer status:Adenocarcinoma | Smoker:Current | Gender:F"
-# into a named character vector with canonical column names.
-.parse_factor_cell <- function(s) {
-  out <- c(
-    Organ = NA_character_, Cancer_status = NA_character_,
-    Smoker = NA_character_, Gender = NA_character_
-  )
-  if (is.na(s)) {
-    return(out)
-  }
-  for (part in strsplit(s, "\\|")[[1]]) {
-    part <- trimws(part)
-    idx <- regexpr(":", part, fixed = TRUE)
-    if (idx > 0) {
-      k <- trimws(substr(part, 1, idx - 1))
-      v <- trimws(substr(part, idx + 1, nchar(part)))
-      key <- switch(k,
-        "Organ"         = "Organ",
-        "Cancer status" = "Cancer_status",
-        "Smoker"        = "Smoker",
-        "Gender"        = "Gender",
-        NA_character_
-      )
-      if (!is.na(key)) out[key] <- v
-    }
-  }
-  out
-}
-
-# Read one MSdata file. Returns a list with:
-#   $mat     : numeric matrix [metabolites x samples], rownames = Metabolite_name
-#   $refmet  : data.frame mapping Metabolite_name -> RefMet_name
-#   $factors : data.frame [samples x {Organ, Cancer_status, Smoker, Gender}]
-read_msdata <- function(path) {
-  df <- read.delim(path,
-    sep = "\t", header = TRUE, check.names = FALSE,
-    stringsAsFactors = FALSE, quote = ""
-  )
-  names(df) <- trimws(names(df))
-  metcol <- names(df)[1]
-  refcol <- names(df)[2]
-  df[[metcol]] <- trimws(df[[metcol]])
-  sample_ids <- names(df)[-(1:2)]
-
-  fac_row <- df[df[[metcol]] == "Factors", , drop = FALSE]
-  data_rows <- df[df[[metcol]] != "Factors", , drop = FALSE]
-  # Drop empty/blank spacer rows (no metabolite name -> cannot be keyed)
-  data_rows <- data_rows[!is.na(data_rows[[metcol]]) &
-    nzchar(data_rows[[metcol]]), , drop = FALSE]
-
-  # Factors -> data.frame
-  fac_strings <- as.character(unlist(fac_row[1, sample_ids]))
-  fac <- t(vapply(fac_strings, .parse_factor_cell,
-    FUN.VALUE = c(
-      Organ = "", Cancer_status = "",
-      Smoker = "", Gender = ""
-    )
-  ))
-  rownames(fac) <- sample_ids
-  factors_df <- as.data.frame(fac, stringsAsFactors = FALSE)
-
-  # Intensity matrix (metabolites x samples), coerced to numeric
-  mat <- as.matrix(data_rows[, sample_ids, drop = FALSE])
-  storage.mode(mat) <- "numeric"
-  rownames(mat) <- data_rows[[metcol]]
-
-  refmet <- data.frame(
-    Metabolite_name = data_rows[[metcol]],
-    RefMet_name = data_rows[[refcol]],
-    stringsAsFactors = FALSE
-  )
-
-  list(mat = mat, refmet = refmet, factors = factors_df)
-}
-
-
+# =============================================================================
 # Metabolomics normalization helpers and limma wrapper.
 # Replaces the MetaboAnalystR QC/DE pipeline for Track-A analysis.
 # Pipeline: median row-norm → log2 → [Pareto for PCA] → limma.
 # All comments in English.
-
+# =============================================================================
 
 # -- 1. Feature filtering -----------------------------------------------------
 
@@ -100,13 +18,10 @@ filter_low_var <- function(mat, min_cv = 0.10) {
     if (is.na(m) || m == 0) 0 else sd(x, na.rm = TRUE) / abs(m)
   })
   keep <- cv >= min_cv
-  if (any(!keep)) {
-    message(sprintf(
-      "[FILTER] Dropped %d low-variance feature(s) (CV < %.2f): %s",
-      sum(!keep), min_cv,
-      paste(names(cv)[!keep], collapse = ", ")
-    ))
-  }
+  if (any(!keep))
+    message(sprintf("[FILTER] Dropped %d low-variance feature(s) (CV < %.2f): %s",
+                    sum(!keep), min_cv,
+                    paste(names(cv)[!keep], collapse = ", ")))
   mat[, keep, drop = FALSE]
 }
 
@@ -143,8 +58,8 @@ log2_transform <- function(mat) {
 #' @returns Pareto-scaled matrix
 pareto_scale <- function(mat) {
   means <- colMeans(mat, na.rm = TRUE)
-  sds <- apply(mat, 2, sd, na.rm = TRUE)
-  sds[is.na(sds) | sds <= 0] <- 1 # protect against zero-variance columns
+  sds   <- apply(mat, 2, sd, na.rm = TRUE)
+  sds[is.na(sds) | sds <= 0] <- 1        # protect against zero-variance columns
   sweep(sweep(mat, 2, means, "-"), 2, sqrt(sds), "/")
 }
 
@@ -167,7 +82,7 @@ pareto_scale <- function(mat) {
 #' @returns Named list as described above
 prepare_matrix <- function(df, feat_cols,
                            meta_cols = META_COLS,
-                           min_cv = 0.10) {
+                           min_cv    = 0.10) {
   raw_mat <- as.matrix(df[, feat_cols, drop = FALSE])
   storage.mode(raw_mat) <- "double"
   rownames(raw_mat) <- df$sample_id
@@ -196,30 +111,21 @@ check_covariates <- function(meta) {
   print(table(class = meta$class, gender = meta$gender, useNA = "ifany"))
 
   n_na <- sum(is.na(meta$smoker)) + sum(is.na(meta$gender))
-  if (n_na > 0) {
-    warning(
-      "[COVARIATES] ", n_na,
-      " NA(s) in smoker/gender — those samples are dropped by model.matrix()."
-    )
-  }
+  if (n_na > 0)
+    warning("[COVARIATES] ", n_na,
+            " NA(s) in smoker/gender — those samples are dropped by model.matrix().")
 
   fit_chk <- tryCatch(
     lm(as.numeric(factor(meta$class)) ~ meta$smoker + meta$gender),
-    error = function(e) {
-      message("[COVARIATES] lm check failed: ", e$message)
-      NULL
-    }
+    error = function(e) { message("[COVARIATES] lm check failed: ", e$message); NULL }
   )
   if (!is.null(fit_chk)) {
     al <- alias(fit_chk)$Complete
-    if (!is.null(al) && nrow(al) > 0) {
-      warning(
-        "[COVARIATES] Perfect aliasing: ", paste(rownames(al), collapse = ", "),
-        ". Drop the aliased covariate before fitting."
-      )
-    } else {
+    if (!is.null(al) && nrow(al) > 0)
+      warning("[COVARIATES] Perfect aliasing: ", paste(rownames(al), collapse = ", "),
+              ". Drop the aliased covariate before fitting.")
+    else
       message("[COVARIATES] No aliasing detected — model is estimable.")
-    }
   }
 
   invisible(list(
@@ -249,58 +155,52 @@ check_covariates <- function(meta) {
 #' @param neg_class Reference class (denominator; default from PARAMS)
 #' @returns data.frame with per-feature DE statistics
 run_limma_de <- function(mat_de, meta,
-                         label = "",
+                         label     = "",
                          pos_class = PARAMS$positive_class,
                          neg_class = PARAMS$negative_class) {
+
   # Drop samples with NA covariates
   complete_idx <- !is.na(meta$smoker) & !is.na(meta$gender)
   if (any(!complete_idx)) {
-    message(
-      "[LIMMA] Dropping ", sum(!complete_idx),
-      " sample(s) with NA smoker/gender."
-    )
-    meta <- meta[complete_idx, , drop = FALSE]
+    message("[LIMMA] Dropping ", sum(!complete_idx),
+            " sample(s) with NA smoker/gender.")
+    meta   <- meta[complete_idx, , drop = FALSE]
     mat_de <- mat_de[meta$sample_id, , drop = FALSE]
   }
 
   # Align rows (sample order must match between matrix and metadata)
-  meta <- meta[match(rownames(mat_de), meta$sample_id), , drop = FALSE]
+  meta   <- meta[match(rownames(mat_de), meta$sample_id), , drop = FALSE]
 
-  meta$class <- factor(meta$class, levels = c(neg_class, pos_class))
+  meta$class  <- factor(meta$class,  levels = c(neg_class, pos_class))
   meta$smoker <- droplevels(factor(meta$smoker))
   meta$gender <- droplevels(factor(meta$gender))
 
   design <- model.matrix(~ class + smoker + gender, data = meta)
-  design <- design[, colSums(abs(design)) > 0, drop = FALSE] # drop empty cols
+  design <- design[, colSums(abs(design)) > 0, drop = FALSE]  # drop empty cols
 
   fit <- limma::lmFit(t(mat_de), design)
   fit <- limma::eBayes(fit, trend = TRUE)
 
   coef_name <- paste0("class", pos_class)
-  if (!coef_name %in% colnames(fit$coefficients)) {
-    stop(
-      "[LIMMA] Coefficient not found: '", coef_name,
-      "'. Available: ", paste(colnames(fit$coefficients), collapse = ", ")
-    )
-  }
+  if (!coef_name %in% colnames(fit$coefficients))
+    stop("[LIMMA] Coefficient not found: '", coef_name,
+         "'. Available: ", paste(colnames(fit$coefficients), collapse = ", "))
 
-  tt <- limma::topTable(fit,
-    coef = coef_name, number = Inf,
-    adjust.method = "BH", sort.by = "P"
-  )
+  tt <- limma::topTable(fit, coef = coef_name, number = Inf,
+                        adjust.method = "BH", sort.by = "P")
 
   data.frame(
-    metabolite = rownames(tt),
-    logFC = tt$logFC, # log2 fold change (ADC / Healthy)
-    AveExpr = tt$AveExpr,
-    t_stat = tt$t,
-    p_value = tt$P.Value,
+    metabolite  = rownames(tt),
+    logFC       = tt$logFC,         # log2 fold change (ADC / Healthy)
+    AveExpr     = tt$AveExpr,
+    t_stat      = tt$t,
+    p_value     = tt$P.Value,
     adj_p_value = tt$adj.P.Val,
-    B = tt$B, # log-odds of DE
+    B           = tt$B,             # log-odds of DE
     significant = tt$adj.P.Val < PVAL_THRESH & abs(tt$logFC) > log2(FC_THRESH),
-    direction = ifelse(tt$logFC > 0, "Up", "Down"),
-    label = label,
-    row.names = NULL,
+    direction   = ifelse(tt$logFC > 0, "Up", "Down"),
+    label       = label,
+    row.names   = NULL,
     stringsAsFactors = FALSE
   )
 }
