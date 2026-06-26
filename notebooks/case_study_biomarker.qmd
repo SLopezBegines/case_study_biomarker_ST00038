@@ -41,6 +41,9 @@ Per the design, the differential is run **within ADC1 only**, **separately per b
 # Setting up environment
 
 ```{r env}
+rm(list=ls())
+gc()
+
 source(file.path("..", "config", "params.R"))
 
 set.seed(PARAMS$seed)
@@ -81,15 +84,10 @@ Each file holds samples in rows: metadata columns
 137 shared metabolites.
 
 ```{r load}
-read_matrix <- function(name)
-  read.csv(file.path(DATA, paste0(name, ".csv")), check.names = FALSE)
+analysis_matrices <- readRDS(file.path(RDAT, "analysis_matrices.rds"))
 
-mats <- list(
-  ADC1_Plasma = read_matrix("ADC1_Plasma"),
-  ADC1_Serum  = read_matrix("ADC1_Serum"),
-  ADC2_Plasma = read_matrix("ADC2_Plasma"),
-  ADC2_Serum  = read_matrix("ADC2_Serum")
-)
+mats <- analysis_matrices$matrices
+
 META_COLS <- c("sample_id", "cohort", "biofluid", "class", "smoker", "gender")
 FEATURES  <- setdiff(colnames(mats$ADC1_Plasma), META_COLS)
 cat("Shared metabolites (features):", length(FEATURES), "\n")
@@ -98,22 +96,13 @@ cat("Shared metabolites (features):", length(FEATURES), "\n")
 # Experimental design
 
 ```{r design}
-comp <- do.call(rbind, lapply(mats, function(d)
-  as.data.frame(table(cohort = d$cohort, biofluid = d$biofluid, class = d$class))))
-comp <- comp[comp$Freq > 0, ]
-knitr::kable(comp, caption = "Composition: Adenocarcinoma vs Healthy by cohort and biofluid") |>
+analysis_matrices$cohort_composition |> 
+knitr::kable(caption = "Composition: Adenocarcinoma vs Healthy by cohort and biofluid") |>
   kableExtra::kable_paper(full_width = FALSE, position = "center")
 ```
 
 The differential (Track A) uses the **ADC1** cohort only, one model per biofluid.
 
-```{r clean-env}
-rm(list = intersect(
-  c("adc1","adc2","fr","matrices","mdata.all","mdata.siggenes",
-    "obj","sample_sheet","shared_tbl"),
-  ls()
-))
-```
 
 # Quality Control
 
@@ -167,6 +156,8 @@ if (nrow(NA_distribution_post) == 0) {
     knitr::kable(caption = "Remaining missing values after imputation") |>
     kableExtra::kable_paper(full_width = FALSE, position = "center")
 }
+
+rm(NA_distribution, NA_distribution_post)
 ```
 
 ## Feature preparation
@@ -200,6 +191,8 @@ feat_counts <- lapply(names(adc1), function(nm) {
 do.call(rbind, feat_counts) |>
   knitr::kable(caption = "Feature count before/after low-variance filter") |>
   kableExtra::kable_paper(full_width = FALSE, position = "center")
+
+rm(feat_counts)
 ```
 
 # Normalisation
@@ -224,8 +217,8 @@ if (check_checkpoint("norm_results")) {
 
 # Dimensions after normalisation
 for (nm in names(prep_res)) {
-  cat(nm, "— DE matrix:", nrow(prep_res[[nm]]$mat_de),
-      "samples ×", ncol(prep_res[[nm]]$mat_de), "features\n")
+  cat(nm, "— DE matrix:", nrow(prep_res[[nm]]$mat_log2),
+      "samples ×", ncol(prep_res[[nm]]$mat_log2), "features\n")
 }
 ```
 
@@ -234,66 +227,12 @@ for (nm in names(prep_res)) {
 Density (all features, per sample) and per-sample boxplots before and after log2 transform.
 
 ```{r norm-qc-plots, fig.width=14, fig.height=10}
-make_norm_qc <- function(raw_mat, log2_mat, meta, label) {
-  cls <- as.character(meta$class[match(rownames(raw_mat), meta$sample_id)])
 
-  # Long format helpers
-  to_long <- function(mat, stage) {
-    df <- as.data.frame(mat)
-    df$sample <- rownames(df)
-    df$class  <- cls
-    df$stage  <- stage
-    tidyr::pivot_longer(df, -c(sample, class, stage),
-                        names_to = "feature", values_to = "value")
-  }
-
-  raw_long  <- to_long(raw_mat,  "Raw (imputed)")
-  log2_long <- to_long(log2_mat, "Log2")
-
-  # Random 30 features for boxplots
-  set.seed(PARAMS$seed)
-  feat_sub  <- sample(colnames(raw_mat), min(30L, ncol(raw_mat)))
-
-  # Density of sample means (before vs after)
-  mean_df <- dplyr::bind_rows(
-    raw_long  |> dplyr::summarise(mean_val = mean(value, na.rm=TRUE),
-                                   .by = c(sample, class, stage)),
-    log2_long |> dplyr::summarise(mean_val = mean(value, na.rm=TRUE),
-                                   .by = c(sample, class, stage))
-  ) |> dplyr::mutate(stage = factor(stage, levels = c("Raw (imputed)", "Log2")))
-
-  p_density <- ggplot2::ggplot(mean_df,
-                                ggplot2::aes(x = mean_val, colour = class,
-                                             linetype = stage)) +
-    ggplot2::geom_density(linewidth = 0.9) +
-    ggplot2::scale_colour_manual(values = c(Adenocarcinoma = "firebrick3",
-                                             Healthy = "steelblue4")) +
-    ggplot2::facet_wrap(~stage, scales = "free_x") +
-    ggplot2::labs(title = paste("Sample-mean density —", label),
-                  x = "Mean intensity", y = "Density",
-                  colour = "Class", linetype = "Stage") +
-    ggplot2::theme_bw()
-
-  # Per-sample boxplot after log2 (coloured by class)
-  log2_sub  <- log2_long |> dplyr::filter(feature %in% feat_sub)
-  p_box <- ggplot2::ggplot(log2_sub,
-                            ggplot2::aes(x = sample, y = value, fill = class)) +
-    ggplot2::geom_boxplot(outlier.size = 0.3, linewidth = 0.3) +
-    ggplot2::scale_fill_manual(values = c(Adenocarcinoma = "firebrick3",
-                                           Healthy = "steelblue4")) +
-    ggplot2::labs(title = paste("Per-sample distribution (log2, 30 features) —", label),
-                  x = NULL, y = "log2 intensity", fill = "Class") +
-    ggplot2::theme_bw() +
-    ggplot2::theme(axis.text.x = ggplot2::element_blank(),
-                   axis.ticks.x = ggplot2::element_blank())
-
-  patchwork::wrap_plots(p_density, p_box, ncol = 1, heights = c(1, 1.5))
-}
 
 for (nm in names(prep_res)) {
   p <- make_norm_qc(
     raw_mat  = prep_res[[nm]]$raw,
-    log2_mat = prep_res[[nm]]$mat_de,
+    log2_mat = prep_res[[nm]]$mat_log2,
     meta     = prep_res[[nm]]$meta,
     label    = nm
   )
@@ -309,11 +248,11 @@ for (nm in names(prep_res)) {
 ```{r eda-distributions, fig.width=12, fig.height=8}
 # Top 30 variable features per matrix (Pareto-scaled, for visualisation)
 for (nm in names(prep_res)) {
-  var_rank <- sort(apply(prep_res[[nm]]$mat_pca, 2, var, na.rm=TRUE),
+  var_rank <- sort(apply(prep_res[[nm]]$mat_pareto, 2, var, na.rm=TRUE),
                    decreasing = TRUE)
   top30    <- names(var_rank)[seq_len(min(30L, length(var_rank)))]
 
-  long_df <- as.data.frame(prep_res[[nm]]$mat_pca[, top30]) |>
+  long_df <- as.data.frame(prep_res[[nm]]$mat_pareto[, top30]) |>
     tibble::rownames_to_column("sample_id") |>
     dplyr::left_join(
       dplyr::select(prep_res[[nm]]$meta, sample_id, class),
@@ -344,15 +283,14 @@ for (nm in names(prep_res)) {
 
 ```{r eda-correlation, fig.width=10, fig.height=9}
 for (nm in names(prep_res)) {
-  var_rank <- sort(apply(prep_res[[nm]]$mat_de, 2, var, na.rm=TRUE),
+  var_rank <- sort(apply(prep_res[[nm]]$mat_log2, 2, var, na.rm=TRUE),
                    decreasing = TRUE)
   top30 <- names(var_rank)[seq_len(min(30L, length(var_rank)))]
 
   p_corr <- DataExplorer::plot_correlation(
-    as.data.frame(prep_res[[nm]]$mat_de[, top30]),
+    as.data.frame(prep_res[[nm]]$mat_log2[, top30]),
     title = paste("Feature correlation (top 30, log2) —", nm)
   )
-  print(p_corr)
   save_plot(paste0("eda_correlation_", nm), p_corr,
             width = 10, height = 9, subdir = "EDA")
 }
@@ -364,7 +302,7 @@ for (nm in names(prep_res)) {
 pca_results <- list()
 
 for (nm in names(prep_res)) {
-  mat_pca <- prep_res[[nm]]$mat_pca
+  mat_pca <- prep_res[[nm]]$mat_pareto
   meta    <- prep_res[[nm]]$meta
   cls     <- meta$class[match(rownames(mat_pca), meta$sample_id)]
 
@@ -451,7 +389,7 @@ if (check_checkpoint("de_results")) {
 } else {
   de_results <- lapply(names(prep_res), function(nm) {
     run_limma_de(
-      mat_de = prep_res[[nm]]$mat_de,
+      mat_de = prep_res[[nm]]$mat_pareto,
       meta   = prep_res[[nm]]$meta,
       label  = nm
     )
@@ -582,10 +520,15 @@ for (nm in names(de_results)) {
     next
   }
 
-  mat_h <- t(prep_res[[nm]]$mat_de[, sig, drop = FALSE])   # features × samples
+  mat_h <- t(prep_res[[nm]]$mat_pareto[, sig, drop = FALSE])   # features × samples
   meta_h <- prep_res[[nm]]$meta
   meta_h <- meta_h[match(colnames(mat_h), meta_h$sample_id), , drop = FALSE]
 
+# Sort samples by Class → Gender → Smoker
+  sort_order <- order(meta_h$class, meta_h$gender, meta_h$smoker)
+  meta_h     <- meta_h[sort_order, , drop = FALSE]
+  mat_h      <- mat_h[, sort_order, drop = FALSE]
+  
   annot_col <- data.frame(
     Class  = meta_h$class,
     Smoker = meta_h$smoker,
@@ -610,6 +553,7 @@ for (nm in names(de_results)) {
   heat_fn <- function() {
     pheatmap::pheatmap(
       mat_h,
+      cluster_cols = FALSE,
       annotation_col    = annot_col,
       annotation_colors = annot_colors,
       scale             = "row",
@@ -631,7 +575,7 @@ for (nm in names(de_results)) {
 # Results summary
 
 ```{r results-summary}
-# Overlap between Plasma and Serum significant metabolites
+Overlap between Plasma and Serum significant metabolites
 sig_plasma <- de_results$ADC1_Plasma |>
   dplyr::filter(significant) |> dplyr::pull(metabolite)
 sig_serum  <- de_results$ADC1_Serum  |>

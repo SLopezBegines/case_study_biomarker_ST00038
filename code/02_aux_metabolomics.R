@@ -183,6 +183,86 @@ prepare_matrix <- function(df, feat_cols,
   )
 }
 
+
+# ----- 4. Quality Control plots ------------####
+
+
+make_norm_qc <- function(raw_mat, log2_mat, meta, label) {
+  cls <- as.character(meta$class[match(rownames(raw_mat), meta$sample_id)])
+
+  # Long format helpers
+  to_long <- function(mat, stage) {
+    df <- as.data.frame(mat)
+    df$sample <- rownames(df)
+    df$class <- cls
+    df$stage <- stage
+    tidyr::pivot_longer(df, -c(sample, class, stage),
+      names_to = "feature", values_to = "value"
+    )
+  }
+
+  raw_long <- to_long(raw_mat, "Raw (imputed)")
+  log2_long <- to_long(log2_mat, "Log2")
+
+  # Random 30 features for boxplots
+  set.seed(PARAMS$seed)
+  feat_sub <- sample(colnames(raw_mat), min(30L, ncol(raw_mat)))
+
+  # Density of sample means (before vs after)
+  mean_df <- dplyr::bind_rows(
+    raw_long |> dplyr::summarise(
+      mean_val = mean(value, na.rm = TRUE),
+      .by = c(sample, class, stage)
+    ),
+    log2_long |> dplyr::summarise(
+      mean_val = mean(value, na.rm = TRUE),
+      .by = c(sample, class, stage)
+    )
+  ) |> dplyr::mutate(stage = factor(stage, levels = c("Raw (imputed)", "Log2")))
+
+  p_density <- ggplot2::ggplot(
+    mean_df,
+    ggplot2::aes(
+      x = mean_val, colour = class,
+      linetype = stage
+    )
+  ) +
+    ggplot2::geom_density(linewidth = 0.9) +
+    ggplot2::scale_colour_manual(values = c(
+      Adenocarcinoma = "firebrick3",
+      Healthy = "steelblue4"
+    )) +
+    ggplot2::facet_wrap(~stage, scales = "free_x") +
+    ggplot2::labs(
+      title = paste("Sample-mean density —", label),
+      x = "Mean intensity", y = "Density",
+      colour = "Class", linetype = "Stage"
+    ) +
+    ggplot2::theme_bw()
+
+  # Per-sample boxplot after log2 (coloured by class)
+  log2_sub <- log2_long |> dplyr::filter(feature %in% feat_sub)
+  p_box <- ggplot2::ggplot(
+    log2_sub,
+    ggplot2::aes(x = sample, y = value, fill = class)
+  ) +
+    ggplot2::geom_boxplot(outlier.size = 0.3, linewidth = 0.3) +
+    ggplot2::scale_fill_manual(values = c(
+      Adenocarcinoma = "firebrick3",
+      Healthy = "steelblue4"
+    )) +
+    ggplot2::labs(
+      title = paste("Per-sample distribution (log2, 30 features) —", label),
+      x = NULL, y = "log2 intensity", fill = "Class"
+    ) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_blank(),
+      axis.ticks.x = ggplot2::element_blank()
+    )
+
+  patchwork::wrap_plots(p_density, p_box, ncol = 1, heights = c(1, 1.5))
+}
 # -- 4. Covariate diagnostics -------------------------------------------------
 
 #' Cross-tabulate class vs covariates and check for perfect aliasing.

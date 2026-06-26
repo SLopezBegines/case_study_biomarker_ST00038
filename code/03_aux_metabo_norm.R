@@ -18,10 +18,13 @@ filter_low_var <- function(mat, min_cv = 0.10) {
     if (is.na(m) || m == 0) 0 else sd(x, na.rm = TRUE) / abs(m)
   })
   keep <- cv >= min_cv
-  if (any(!keep))
-    message(sprintf("[FILTER] Dropped %d low-variance feature(s) (CV < %.2f): %s",
-                    sum(!keep), min_cv,
-                    paste(names(cv)[!keep], collapse = ", ")))
+  if (any(!keep)) {
+    message(sprintf(
+      "[FILTER] Dropped %d low-variance feature(s) (CV < %.2f): %s",
+      sum(!keep), min_cv,
+      paste(names(cv)[!keep], collapse = ", ")
+    ))
+  }
   mat[, keep, drop = FALSE]
 }
 
@@ -58,8 +61,8 @@ log2_transform <- function(mat) {
 #' @returns Pareto-scaled matrix
 pareto_scale <- function(mat) {
   means <- colMeans(mat, na.rm = TRUE)
-  sds   <- apply(mat, 2, sd, na.rm = TRUE)
-  sds[is.na(sds) | sds <= 0] <- 1        # protect against zero-variance columns
+  sds <- apply(mat, 2, sd, na.rm = TRUE)
+  sds[is.na(sds) | sds <= 0] <- 1 # protect against zero-variance columns
   sweep(sweep(mat, 2, means, "-"), 2, sqrt(sds), "/")
 }
 
@@ -82,7 +85,7 @@ pareto_scale <- function(mat) {
 #' @returns Named list as described above
 prepare_matrix <- function(df, feat_cols,
                            meta_cols = META_COLS,
-                           min_cv    = 0.10) {
+                           min_cv = 0.10) {
   raw_mat <- as.matrix(df[, feat_cols, drop = FALSE])
   storage.mode(raw_mat) <- "double"
   rownames(raw_mat) <- df$sample_id
@@ -91,10 +94,10 @@ prepare_matrix <- function(df, feat_cols,
   log2_mat <- log2_transform(median_row_norm(filtered))
 
   list(
-    raw     = filtered,
-    mat_de  = log2_mat,
-    mat_pca = pareto_scale(log2_mat),
-    meta    = df[, meta_cols, drop = FALSE]
+    raw = filtered,
+    mat_log2 = log2_mat,
+    mat_pareto = pareto_scale(log2_mat),
+    meta = df[, meta_cols, drop = FALSE]
   )
 }
 
@@ -111,21 +114,30 @@ check_covariates <- function(meta) {
   print(table(class = meta$class, gender = meta$gender, useNA = "ifany"))
 
   n_na <- sum(is.na(meta$smoker)) + sum(is.na(meta$gender))
-  if (n_na > 0)
-    warning("[COVARIATES] ", n_na,
-            " NA(s) in smoker/gender — those samples are dropped by model.matrix().")
+  if (n_na > 0) {
+    warning(
+      "[COVARIATES] ", n_na,
+      " NA(s) in smoker/gender — those samples are dropped by model.matrix()."
+    )
+  }
 
   fit_chk <- tryCatch(
     lm(as.numeric(factor(meta$class)) ~ meta$smoker + meta$gender),
-    error = function(e) { message("[COVARIATES] lm check failed: ", e$message); NULL }
+    error = function(e) {
+      message("[COVARIATES] lm check failed: ", e$message)
+      NULL
+    }
   )
   if (!is.null(fit_chk)) {
     al <- alias(fit_chk)$Complete
-    if (!is.null(al) && nrow(al) > 0)
-      warning("[COVARIATES] Perfect aliasing: ", paste(rownames(al), collapse = ", "),
-              ". Drop the aliased covariate before fitting.")
-    else
+    if (!is.null(al) && nrow(al) > 0) {
+      warning(
+        "[COVARIATES] Perfect aliasing: ", paste(rownames(al), collapse = ", "),
+        ". Drop the aliased covariate before fitting."
+      )
+    } else {
       message("[COVARIATES] No aliasing detected — model is estimable.")
+    }
   }
 
   invisible(list(
@@ -155,52 +167,58 @@ check_covariates <- function(meta) {
 #' @param neg_class Reference class (denominator; default from PARAMS)
 #' @returns data.frame with per-feature DE statistics
 run_limma_de <- function(mat_de, meta,
-                         label     = "",
+                         label = "",
                          pos_class = PARAMS$positive_class,
                          neg_class = PARAMS$negative_class) {
-
   # Drop samples with NA covariates
   complete_idx <- !is.na(meta$smoker) & !is.na(meta$gender)
   if (any(!complete_idx)) {
-    message("[LIMMA] Dropping ", sum(!complete_idx),
-            " sample(s) with NA smoker/gender.")
-    meta   <- meta[complete_idx, , drop = FALSE]
+    message(
+      "[LIMMA] Dropping ", sum(!complete_idx),
+      " sample(s) with NA smoker/gender."
+    )
+    meta <- meta[complete_idx, , drop = FALSE]
     mat_de <- mat_de[meta$sample_id, , drop = FALSE]
   }
 
   # Align rows (sample order must match between matrix and metadata)
-  meta   <- meta[match(rownames(mat_de), meta$sample_id), , drop = FALSE]
+  meta <- meta[match(rownames(mat_de), meta$sample_id), , drop = FALSE]
 
-  meta$class  <- factor(meta$class,  levels = c(neg_class, pos_class))
+  meta$class <- factor(meta$class, levels = c(neg_class, pos_class))
   meta$smoker <- droplevels(factor(meta$smoker))
   meta$gender <- droplevels(factor(meta$gender))
 
   design <- model.matrix(~ class + smoker + gender, data = meta)
-  design <- design[, colSums(abs(design)) > 0, drop = FALSE]  # drop empty cols
+  design <- design[, colSums(abs(design)) > 0, drop = FALSE] # drop empty cols
 
   fit <- limma::lmFit(t(mat_de), design)
   fit <- limma::eBayes(fit, trend = TRUE)
 
   coef_name <- paste0("class", pos_class)
-  if (!coef_name %in% colnames(fit$coefficients))
-    stop("[LIMMA] Coefficient not found: '", coef_name,
-         "'. Available: ", paste(colnames(fit$coefficients), collapse = ", "))
+  if (!coef_name %in% colnames(fit$coefficients)) {
+    stop(
+      "[LIMMA] Coefficient not found: '", coef_name,
+      "'. Available: ", paste(colnames(fit$coefficients), collapse = ", ")
+    )
+  }
 
-  tt <- limma::topTable(fit, coef = coef_name, number = Inf,
-                        adjust.method = "BH", sort.by = "P")
+  tt <- limma::topTable(fit,
+    coef = coef_name, number = Inf,
+    adjust.method = "BH", sort.by = "P"
+  )
 
   data.frame(
-    metabolite  = rownames(tt),
-    logFC       = tt$logFC,         # log2 fold change (ADC / Healthy)
-    AveExpr     = tt$AveExpr,
-    t_stat      = tt$t,
-    p_value     = tt$P.Value,
+    metabolite = rownames(tt),
+    logFC = tt$logFC, # log2 fold change (ADC / Healthy)
+    AveExpr = tt$AveExpr,
+    t_stat = tt$t,
+    p_value = tt$P.Value,
     adj_p_value = tt$adj.P.Val,
-    B           = tt$B,             # log-odds of DE
+    B = tt$B, # log-odds of DE
     significant = tt$adj.P.Val < PVAL_THRESH & abs(tt$logFC) > log2(FC_THRESH),
-    direction   = ifelse(tt$logFC > 0, "Up", "Down"),
-    label       = label,
-    row.names   = NULL,
+    direction = ifelse(tt$logFC > 0, "Up", "Down"),
+    label = label,
+    row.names = NULL,
     stringsAsFactors = FALSE
   )
 }

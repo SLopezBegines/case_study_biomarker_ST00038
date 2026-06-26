@@ -84,13 +84,7 @@ for (cohort in c("ADC1", "ADC2")) {
     }
   }
 }
-saveRDS(
-  list(
-    matrices = matrices, shared = shared,
-    refmet = shared_tbl, params = PARAMS
-  ),
-  file.path(RDAT, "analysis_matrices.rds")
-)
+
 
 # ---- Sample sheet + composition summary ------------------------------------
 sample_sheet <- do.call(rbind, lapply(matrices, function(fr) {
@@ -107,7 +101,21 @@ names(comp) <- c("cohort", "biofluid", "class", "n")
 comp <- comp[comp$n > 0, ]
 write.csv(comp, file.path(TAB, "cohort_composition.csv"), row.names = FALSE)
 
+
+analysis_matrices <- list(
+  matrices = matrices, shared = shared,
+  refmet = shared_tbl, params = PARAMS,
+  cohort_composition = comp, samples = sample_sheet
+)
+saveRDS(
+  analysis_matrices, file.path(RDAT, "analysis_matrices.rds")
+)
+
+
 cat("\n=== Composition (biological, Adenocarcinoma vs Healthy) ===\n")
 print(comp)
 cat("\nMatrices built:", paste(names(matrices), collapse = ", "), "\n")
 cat("Feature count (shared metabolites):", length(shared), "\n")
+
+
+rm(matrices, shared_tbl, shared, adc1, adc2, sample_sheet, comp, fr, obj, bf, classes, build_frame, cohort)

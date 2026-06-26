@@ -20,7 +20,7 @@ MET <- file.path(NB_OUT, "metabo")
 for (d in c(NB_OUT, DATA, FIG, TAB, REP, RDAT, MET)) {
   dir.create(d, showWarnings = FALSE, recursive = TRUE)
 }
-
+rm(d)
 # ==============================================================================
 # Global Variables
 # ==============================================================================
